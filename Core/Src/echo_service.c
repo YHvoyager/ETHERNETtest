@@ -28,6 +28,7 @@
 
 #include "echo_service.h"
 #include "reg_shell.h"      /* 以太网命令：LED / R / W */
+#include "framebuf.h"       /* 二进制整屏帧：FB / FBSEQ */
 
 #include "lwip/udp.h"
 #include "lwip/pbuf.h"
@@ -107,6 +108,14 @@ static char s_tx_buf[ECHO_TX_BUF_SIZE];
  * 比 ECHO_MAX_PAYLOAD 多留 3 字节，刚好够判断最后一个字符是否需要整段回退。
  */
 static char s_rx_raw[ECHO_MAX_PAYLOAD + 4U];
+
+/**
+ * 收二进制整屏帧用的暂存区（static，理由同 s_tx_buf）。
+ *
+ * 一帧是 1024 字节、带序号是 1032 字节 —— 放栈上会瞬间爆栈。收到的原始字节
+ * 先拷到这里，再交给 FB_Dispatch() 校验和显示（见 framebuf.c）。
+ */
+static uint8_t s_fb_buf[FB_SEQ_PACKET_BYTES];
 
 /**
  * 找出 [0, len) 范围内最后一个完整 UTF-8 字符的结束位置。
@@ -391,6 +400,38 @@ static void echo_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
   s_peer_port = port;
   s_have_peer = 1U;
   s_rx_count++;
+
+  /* ---- 0. 先看是不是二进制整屏帧 ----
+   *
+   * 【为什么必须放在最前面】FB / FBSEQ 收的是**裸字节**（1024 或 1032 字节），
+   * 后面那套"取出原文 → 对齐字符边界 → 过滤控制字符 → 当文本"的处理会把
+   * 二进制数据彻底毁掉（0x00 被替成 '.'、0x80 以上的位图字节被当 UTF-8 截断）。
+   *
+   * FB_Dispatch() 只看**数组长度**：正好 1024 / 1032 才认，否则返回 0 交回
+   * 下面走文本路径。文本命令上限 191 字节（SHELL_MAX_LINE），永远不会撞上
+   * 这两个长度，所以两种通道能安全共存。
+   *
+   * 回包：故意不回。发帧是"发了就不管"的，30fps 下每帧等一次往返会被
+   * 时延直接卡死。想知道收了多少帧，发文本命令 FB? 查统计。 */
+  if (p->tot_len == (u16_t)FB_BYTES)
+  {
+    if (pbuf_copy_partial(p, s_fb_buf, (u16_t)FB_BYTES, 0) == (u16_t)FB_BYTES)
+    {
+      (void)FB_Dispatch(s_fb_buf, (uint16_t)FB_BYTES);
+    }
+    pbuf_free(p);
+    return;
+  }
+  if (p->tot_len == (u16_t)FB_SEQ_PACKET_BYTES)
+  {
+    if (pbuf_copy_partial(p, s_fb_buf, (u16_t)FB_SEQ_PACKET_BYTES, 0)
+        == (u16_t)FB_SEQ_PACKET_BYTES)
+    {
+      (void)FB_Dispatch(s_fb_buf, (uint16_t)FB_SEQ_PACKET_BYTES);
+    }
+    pbuf_free(p);
+    return;
+  }
 
   /* ---- 1. 取出原文 ----
    * 先把原始字节完整收到 s_rx_raw（static，不占栈）。这里按 ECHO_MAX_PAYLOAD + 3

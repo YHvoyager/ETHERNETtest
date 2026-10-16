@@ -49,6 +49,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/eth_phy.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/board_io.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/reg_shell.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/framebuf.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/oled.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/font.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/echo_service.c

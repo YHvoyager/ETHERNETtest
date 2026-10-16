@@ -10,6 +10,7 @@
 #include "oled.h"        /* 波特律动 SSD1306 驱动（128x64，I2C2 PH4/PH5） */
 #include "font.h"        /* font16x16 / afont16x8 字库 */
 #include "echo_service.h"
+#include "framebuf.h"    /* FB? —— 二进制整屏帧的收帧统计 */
 #include "main.h"
 #include "i2c.h"        /* hi2c2 —— OLED RAW 子命令要用它读 HAL 错误码 */
 
@@ -249,6 +250,7 @@ static const char *const s_help_text =
   "  OLED RAW <ctrl> <hex...>  send raw I2C bytes, bypassing the driver\r\n"
   "  BROADCAST [port]   mirror frames to a 2nd socket (0 = off)\r\n"
   "  PING               liveness check the PC can use to probe the board\r\n"
+  "  FB?                binary frame stats (good / bad / ooo)\r\n"
   "examples: LED0  |  LED 1 1  |  W 40020014 3  |  OLED TXT 0 HELLO\r\n";
 
 const char *Reg_Shell_Help(void)
@@ -1046,6 +1048,20 @@ int Reg_Shell_Exec(const char *cmd, uint32_t cmd_len,
         return cmd_io_op(id, (ntok >= 2UL) ? tok[1] : "T", out, out_size);
       }
     }
+  }
+
+  /* ---- FB? ---- 二进制收帧统计
+   *
+   * 【为什么需要】二进制帧是"发了就不管"的（见 framebuf.h），PC 端没有回包
+   * 可等。屏幕黑着的时候，这三个数能立刻区分出问题在哪：
+   *   good 在涨        → 板子收到了，问题在 I2C / 屏本身
+   *   bad  在涨        → PC 端打包长度不对（或被 MTU 截断）
+   *   ooo  在涨        → 网络抖动导致乱序，属于正常，丢几帧而已
+   *   三个都不涨       → 包根本没到（端口错、防火墙、或者没绑上 peer） */
+  if (strcmp(tok[0], "FB?") == 0)
+  {
+    (void)FB_Stats(out, out_size);
+    return 1;
   }
 
   /* ---- OLED ---- */

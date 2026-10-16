@@ -57,9 +57,8 @@
 /* External variables --------------------------------------------------------*/
 extern DMA_HandleTypeDef hdma_i2c2_rx;
 extern DMA_HandleTypeDef hdma_i2c2_tx;
-extern I2C_HandleTypeDef hi2c2;   /* OLED 异步刷屏（见文件末尾 I2C2_EV_IRQHandler 注释） */
 /* USER CODE BEGIN EV */
-
+extern I2C_HandleTypeDef hi2c2;   /* OLED 异步刷屏，见文件末尾 I2C2_EV_IRQHandler 注释 */
 /* USER CODE END EV */
 
 /******************************************************************************/

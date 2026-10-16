@@ -496,73 +496,10 @@ int32_t user_phy_get_tick(void)
 /**
   * @brief  Check the ETH link state then update ETH driver and netif link accordingly.
   * @retval None
-  *
-  * 【为什么这个函数必须实现】
-  *   MX_LWIP_Process() 每 100ms 调它一次（lwip.c），用来把 PHY 的链路状态同步给
-  *   lwIP 的 netif。CubeMX 生成的是空函数，意味着 lwIP 永远不知道网线插没插、
-  *   速率是多少 —— netif 的 link 标志永远不对，ARP/ICMP 全会受影响。
-  *
-  * 【为什么不调用 USER_PHY_GetLinkState()】
-  *   读过它的实现（eth_custom_phy_interface.c:323）后发现一个会直接害死 ping 的缺陷：
-  *   它在自协商完成后读 ANAR/ANLPAR 算 common_adv，如果匹配不上任何一个已知的
-  *   "100M-FD / 100M-HD / 10M-FD / 10M-HD"分支，就走到最后的 else，**返回
-  *   USER_PHY_STATUS_LINK_DOWN**。也就是说它把"自协商完成但模式未识别"误报成
-  *   "链路断开"。YT8512C 实测 BSR=0x782D（link=1, autoneg_done=1）走的正是这条路，
-  *   于是 lwIP 被告知链路断开 -> netif link_down -> 不发 ARP -> ping 不通。
-  *
-  * 【PHY 地址固定为 0】
-  *   原理图已确认 YT8512C 的 LED0/PHYADD0(pin24)、LED1/PHYADD1(pin25) 都去驱动 LED，
-  *   没有拉地址，所以地址是 0。这里直接硬编码 0，不走地址扫描 —— 那个扫描的判据
-  *   （regvalue != 0xFFFF）会把 MDIO 悬空读到的 0x7FFF 误判成器件。
-  *
-  * 【BSR 必须连读两次】
-  *   IEEE 802.3 规定 BSR 的 link/autoneg 位是**锁存低**的：读到 0 表示"曾经断过"，
-  *   需要连读两次取第二次的值（第一次读会清掉锁存器）。
   */
 void ethernet_link_check_state(struct netif *netif)
 {
-  uint32_t bsr = 0;
-  uint32_t bcr = 0;
-  static uint8_t s_last_link = 0xFFU;   /* 0xFF = 还没报过，保证第一次一定打印 */
 
-  (void)HAL_ETH_ReadPHYRegister(&heth, 0U, 0x01U, &bsr);   /* 第一次：清锁存 */
-  if (HAL_ETH_ReadPHYRegister(&heth, 0U, 0x01U, &bsr) != HAL_OK)   /* 第二次：取真值 */
-  {
-    return;   /* MDIO 读失败，保持当前状态不动，不要误判成 link down */
-  }
-  (void)HAL_ETH_ReadPHYRegister(&heth, 0U, 0x00U, &bcr);
-
-  if ((bsr & 0x0004U) != 0U)   /* BSR bit2 = Link Status */
-  {
-    /* ---- 链路 UP ---- */
-    if (s_last_link != 1U)
-    {
-      /* ⚠ 不要从 BSR 的 bit11~15 反推"协商结果"。那几个位表示的是 PHY 的**能力**
-       * （支持哪些模式），不是本次协商实际选中的模式。BSR=0x782D 的 bit11~14 全 1，
-       * 含义只是"四种模式我都支持"。实际协商结果在厂商专用寄存器里（YT8512C 是
-       * 0x11），BSR 读不出来。 */
-      printf("[LINK] UP  BSR=0x%04lX autoneg_done=%lu (cap: 100FD=%lu 100HD=%lu 10FD=%lu 10HD=%lu)\r\n",
-             (unsigned long)bsr,
-             (unsigned long)((bsr >> 5) & 1U),
-             (unsigned long)((bsr >> 14) & 1U),
-             (unsigned long)((bsr >> 13) & 1U),
-             (unsigned long)((bsr >> 12) & 1U),
-             (unsigned long)((bsr >> 11) & 1U));
-      s_last_link = 1U;
-    }
-    netif_set_link_up(netif);
-  }
-  else
-  {
-    /* ---- 链路 DOWN ---- */
-    if (s_last_link != 0U)
-    {
-      printf("[LINK] DOWN  BSR=0x%04lX BCR=0x%04lX\r\n",
-             (unsigned long)bsr, (unsigned long)bcr);
-      s_last_link = 0U;
-    }
-    netif_set_link_down(netif);
-  }
 }
 
 void HAL_ETH_RxAllocateCallback(uint8_t **buff)

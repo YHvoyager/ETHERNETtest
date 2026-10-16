@@ -898,7 +898,58 @@ clangd `.cache/`、`__pycache__/`、OS 垃圾文件。
 
 > **每次改动代码后在此追加一条，最新的在最上面。**
 
-### 2026-02-13 — 二进制帧通道 `FB`/`FBSEQ` + PC 端 agent（本轮）
+### 2026-02-13 — I2C2 提到 400kHz + 修复 CubeMX 重新生成的覆盖
+
+**背景**：用户把 I2C2 从 100kHz 改成 400kHz（`ETHERNETtest.ioc` 新增
+`I2C2.I2C_Mode=I2C_Fast`，`Core/Src/i2c.c:43` 变为 `hi2c2.Init.ClockSpeed = 400000;`），
+目的是把 OLED 刷屏的帧率上限从约 11fps 提到约 40fps。
+
+**性能账（这是本轮最重要的数字）**：
+
+| I2C 速率 | 整屏 1024 字节耗时 | 帧率上限 |
+|---|---|---|
+| 100kHz（原） | 约 92 ms | 约 11 fps |
+| 400kHz（现） | 约 23 ms | 约 40 fps |
+
+> ⚠ 注意这只是**理论上限**。`OLED_FlushPoll()` 当前每步仍是阻塞的
+> `HAL_I2C_Master_Transmit`，一步 129 字节 @400kHz 约 2.9ms，8 步共 23ms ——
+> 也就是说一帧仍会占用主循环 23ms。lwIP 在这 23ms 里被切成 8 段跑，
+> **ping 和心跳不会断**，但 40fps 时主循环有 92% 的时间在做 I2C。
+> 真要让主循环彻底解放，仍需 §11 的"刷屏真正走 DMA"。
+
+**CubeMX 重新生成造成的覆盖（本轮全部修回）**：
+
+用户在 CubeMX 里改 I2C 速率触发了重新生成，`git diff` 显示 4 处手写代码被冲掉。
+**关键教训：`USER CODE` 区是有效的，但要放对位置。**
+
+| 文件 | 丢失内容 | 修法 |
+|---|---|---|
+| `Core/Src/main.c` | `MX_I2C2_Init()` 之前被塞进一行 `MX_LWIP_Init()` —— 违反 §3.3 的初始化顺序 | 删掉那一行，恢复 `MX_I2C2_Init()` 紧跟 `MX_USART1_UART_Init()` |
+| `Core/Src/dma.c` | `I2C2_EV_IRQn` / `I2C2_ER_IRQn` 的 NVIC 四行 | 补回 `MX_DMA_Init()` **函数体内**（不是文件末尾的 `USER CODE BEGIN 2`，那个块在函数闭合花括号之后，是文件作用域） |
+| `Core/Src/stm32f4xx_it.c` | `extern I2C_HandleTypeDef hi2c2;` | 补回 `USER CODE BEGIN EV` 区（**两个 Handler 函数本身没丢**，因为它们在 `USER CODE BEGIN 1` 里） |
+
+**没有丢的（`USER CODE` 区保护生效）**：`LWIP/Target/ethernetif.c` 的 5 处手工改动
+**全部健在** —— MAC `02:00:00:12:34:56`（`:163-168`）、`ETH_PHY_Prepare()`（`:212`）、
+`ethernet_link_check_state(netif)`（`:219`）、`HAL_ETH_Start()`（`:237`）、
+三个 `user_phy_*` 回调（`:471-489`）。这说明**只要代码在 `USER CODE` 配对里，
+CubeMX 就不会碰** —— 之前那次全丢是因为当时用自己编的 `USER CODE BEGIN 2b` 标记名，
+CubeMX 不认识。
+
+> **`.ioc` 里 I2C2 的 NVIC 依旧没勾**（只有 `NVIC.DMA1_Stream2_IRQn` /
+> `NVIC.DMA1_Stream7_IRQn`）。所以 `dma.c` 里那 4 行**必须继续手写**，
+> 每次 CubeMX 重新生成后都要检查。想一劳永逸就在 CubeMX 的 NVIC 页把
+> I2C2 event / error interrupt 勾上。
+
+**验证**：`arm-none-eabi-gcc -fsyntax-only -Wall -Wextra -std=gnu11` 检查
+`main.c` / `dma.c` / `stm32f4xx_it.c` / `i2c.c` / `framebuf.c` / `echo_service.c` /
+`reg_shell.c` / `oled.c` / `ethernetif.c` → **9 个全 OK，零警告**。
+
+> ⚠ 实测仍未做：400kHz 下的画质（I2C 过快可能出现丢字节/花屏，SSD1306 数据手册
+> 支持 400kHz 但模块的**上拉电阻**才是关键 —— 阿波罗板上 I2C2 同时挂了 PCF8574，
+> 两个上拉并联后等效阻值偏低，理论上更稳；若出现花屏，先把 `ClockSpeed` 退回
+> 100000 排除速率因素）。
+
+### 2026-02-13 — 二进制帧通道 `FB`/`FBSEQ` + PC 端 agent
 
 **目标**（用户原话）：要一个 agent，「能够理解我的意思使之完成对应的操作在单片机上……
 比如我要显示一个会动的眼睛，一个会奔跑的马，以以太网的速率」。并追问过

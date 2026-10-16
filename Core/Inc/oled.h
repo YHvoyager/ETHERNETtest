@@ -18,6 +18,29 @@ void OLED_NewFrame();
 void OLED_ShowFrame();
 void OLED_SetPixel(uint8_t x, uint8_t y, OLED_ColorMode color);
 
+/* ---------------------------------------------------------------------------
+ * 【本工程新增】非阻塞刷屏
+ *
+ * 原版 OLED_ShowFrame() 一次同步发 8 页 = 1024 字节 @100kHz ≈ 92ms，
+ * 期间主循环里的 MX_LWIP_Process() 完全停摆（ping 丢包、心跳间隔抖动）。
+ *
+ * 现在 OLED_ShowFrame() 只把第一页启动起来就返回，后续由主循环里的
+ * OLED_FlushPoll() 一页一步推进，每步最长约 2.8ms（129 字节 @100kHz）。
+ *
+ *   while (1) {
+ *     MX_LWIP_Process();
+ *     Echo_Service_Poll();
+ *     OLED_FlushPoll();       <-- 加这一句
+ *   }
+ *
+ * OLED_ShowFrameBlocking() 保留原版阻塞语义，只在开机画面、OLED INIT
+ * 这种"必须发完再往下走"的场合用。
+ * ------------------------------------------------------------------------- */
+uint8_t  OLED_FlushPoll(void);
+uint8_t  OLED_FlushBusy(void);
+uint32_t OLED_FlushDropped(void);
+void     OLED_ShowFrameBlocking(void);
+
 void OLED_DrawLine(uint8_t x1, uint8_t y1, uint8_t x2, uint8_t y2, OLED_ColorMode color);
 void OLED_DrawRectangle(uint8_t x, uint8_t y, uint8_t w, uint8_t h, OLED_ColorMode color);
 void OLED_DrawFilledRectangle(uint8_t x, uint8_t y, uint8_t w, uint8_t h, OLED_ColorMode color);

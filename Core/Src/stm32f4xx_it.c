@@ -57,6 +57,7 @@
 /* External variables --------------------------------------------------------*/
 extern DMA_HandleTypeDef hdma_i2c2_rx;
 extern DMA_HandleTypeDef hdma_i2c2_tx;
+extern I2C_HandleTypeDef hi2c2;   /* OLED 异步刷屏（见文件末尾 I2C2_EV_IRQHandler 注释） */
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -228,5 +229,46 @@ void DMA1_Stream7_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+/* ---------------------------------------------------------------------------
+ * I2C2 事件/错误中断 —— OLED 异步刷屏需要
+ *
+ * 【为什么必须显式写这两个 Handler】(x) 由 CubeMX 生成的一版里，I2C2 EV/ER
+ * 中断**没有开**，因为 .ioc 里 I2C2 的 NVIC 没勾（只有 DMA1_Stream2/7 被勾上
+ * 了）。DMA 传完最后一个字节只说明"数据都塞进 I2C2 的 TXDR 了"，**不等于**
+ * 最后一个字节已经从 SCL/SDA 上移出去。
+ *
+ * 用 HAL_I2C_Master_Transmit_DMA() 时，HAL 库的收尾逻辑是这样的：
+ *   1. 传完 N 个字节 -> 进 I2C_IT_TC 中断 -> HAL_I2C_ITMasterCpltCallback()
+ *   2. 该回调里再调 I2C_ITError / I2C_ITMasterSequentialCplt，最终调用
+ *      __HAL_I2C_DISABLE_IT(&hi2c2, I2C_IT_TCI) 并置 state = READY、
+ *      调用 HAL_I2C_MasterTxCpltCallback()。
+ *
+ * 所以**少了 I2C2_EV_IRQHandler，状态机永远回不到 READY**：第一次 DMA 刷屏
+ * 会正常完成（数据确实发出去了），但 hi2c2.State 卡在 BUSY_TX，之后所有
+ * I2C 操作（包括 PCF8574 的 ETH_RESET 和第二次刷屏）统统 HAL_BUSY 失败。
+ * 这个坑不会立刻暴露 —— 第一次刷屏看起来完全正常。
+ * ------------------------------------------------------------------------- */
+void I2C2_EV_IRQHandler(void)
+{
+  /* USER CODE BEGIN I2C2_EV_IRQn 0 */
+
+  /* USER CODE END I2C2_EV_IRQn 0 */
+  HAL_I2C_EV_IRQHandler(&hi2c2);
+  /* USER CODE BEGIN I2C2_EV_IRQn 1 */
+
+  /* USER CODE END I2C2_EV_IRQn 1 */
+}
+
+void I2C2_ER_IRQHandler(void)
+{
+  /* USER CODE BEGIN I2C2_ER_IRQn 0 */
+
+  /* USER CODE END I2C2_ER_IRQn 0 */
+  HAL_I2C_ER_IRQHandler(&hi2c2);
+  /* USER CODE BEGIN I2C2_ER_IRQn 1 */
+
+  /* USER CODE END I2C2_ER_IRQn 1 */
+}
 
 /* USER CODE END 1 */

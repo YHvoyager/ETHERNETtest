@@ -1,7 +1,7 @@
 # AGENTS.md — ETHERNETtest 工程工作手册
 
 > **本文件给未来的 AI 助手（和我自己）看。每次改动代码后必须更新本文件。**
-> 最后更新：2026-02-13 | 上一次提交：`bef83dd`（本次提交写入时尚未生成哈希）
+> 最后更新：2026-02-13 | 上一次提交：`a9f2452`（本次提交写入时尚未生成哈希）
 
 ---
 
@@ -372,7 +372,10 @@ typedef struct {
 | | `OLED TXT <行 0..3> <文本...>` | 在指定行写字（先擦该行再画，见 §3.9 的字库分派） |
 | | `OLED PIX <x> <y> [0\|1]` | 画/擦一个像素 |
 | | `OLED RD <寄存器>` | **直接读 SSD1306 寄存器**（波特律动 `OLED_ReadCmd`），排障用 |
-| | `OLED RAW <hex...>` | 把原始字节直发 `0x78`，**完全绕开驱动**的逃生口 |
+| | `OLED REFRESH` | 按 `s_oled_lines[]` 重画整屏 |
+| | `OLED BAR <x> <y> <w> <h> [0\|1]` | 实心矩形（给"动眼睛"打底） |
+| | `OLED STAT` | 后台刷屏状态：`busy=` / `dropped=`（调优用） |
+| | `OLED RAW <ctrl> <hex...>` | 把原始字节直发 `0x78`，**完全绕开驱动**的逃生口 |
 | `BROADCAST` | `BROADCAST [port]` | 大帧回包另发一份到这个端口（`0` = 关） |
 | `PING` | `PING` | 回 `PONG tick=...`，最便宜的"活着吗"探测 |
 
@@ -766,7 +769,60 @@ clangd `.cache/`、`__pycache__/`、OS 垃圾文件。
 
 > **每次改动代码后在此追加一条，最新的在最上面。**
 
-### 2026-02-13 — 切换到波特律动 OLED 驱动（本提交）
+### 2026-02-13 — OLED 异步刷屏：把 92ms 阻塞拆成 8 步（本提交）
+
+**问题**：波特律动的 `OLED_ShowFrame()` 一次同步发 8 页 = 1024 字节 @100kHz
+≈ **92ms**，期间主循环里的 `MX_LWIP_Process()` 完全停摆 —— ping 丢包、心跳
+间隔抖动，违反 §3.3 的"`while(1)` 里不能有阻塞式轮询"。
+
+**做法**：把原来"一口气发完"改成由主循环推进的状态机。
+
+- `Core/Src/oled.c` + `Core/Inc/oled.h`：
+  - 新增 static 状态 `s_flush_buf[129]` / `s_flush_active` / `s_flush_stage` /
+    `s_flush_page` / `s_flush_dropped`。
+  - **`OLED_ShowFrame()` 改为异步**：若上一帧还没发完就 `s_flush_dropped++; return;`
+    （**丢帧**），否则记下页号并立刻启动第一页再返回。
+  - **新增 `OLED_FlushPoll(void)`**：每次调用只推进一小步（发一页的换页命令，
+    或发一页的 129 字节数据），最长阻塞约 **2.8ms**。返回 1 = 传输中、0 = 空闲。
+  - **新增 `OLED_ShowFrameBlocking(void)`**：保留原版阻塞语义，原函数体整体改名而来。
+  - 新增 `OLED_FlushBusy()` / `OLED_FlushDropped()`（后者读后清零）供 `OLED STAT` 用。
+  - `s_flush_buf` 只有 129 字节、**是每页现从 `OLED_GRAM` 拷一份**，不是 8 页共用
+    整屏缓冲 —— 这样显存可以在传输途中被安全改写。
+  - ⚠ **`OLED_Init()` 里的 `OLED_ShowFrame()` 必须改成 `OLED_ShowFrameBlocking()`**：
+    初始化在 `main()` 进主循环之前跑，用异步版则屏上只有第一页有内容，且
+    `s_flush_active` 会一直挂着，导致主循环第一次刷屏被当成"上一帧没发完"丢掉。
+- `Core/Src/main.c`：开机画面改用 `OLED_ShowFrameBlocking()`（那一刻还没有网络
+  要伺候）；`while(1)` 里 `Echo_Service_Poll()` 之后新增 **`OLED_FlushPoll();`**。
+- `Core/Src/dma.c`：`MX_DMA_Init()` 内新增 `I2C2_EV_IRQn` / `I2C2_ER_IRQn` 的
+  `HAL_NVIC_SetPriority(..., 0, 0)` + `HAL_NVIC_EnableIRQ(...)`。**`.ioc` 里 I2C2
+  的 NVIC 没勾**（只勾了 DMA1_Stream2/7），这两句必须手写。
+- `Core/Src/stm32f4xx_it.c`：新增 `I2C2_EV_IRQHandler()` / `I2C2_ER_IRQHandler()`
+  调 `HAL_I2C_EV_IRQHandler(&hi2c2)` / `HAL_I2C_ER_IRQHandler(&hi2c2)`。
+  少了它们，`hi2c2.State` 永远回不到 `READY`（DMA 传完只说明数据进了 TXDR，
+  不等于已经从 SCL/SDA 移出去），第一次刷屏看起来正常，之后所有 I2C
+  （含 PCF8574 的 ETH_RESET）全部 `HAL_BUSY`。
+- `Core/Src/reg_shell.c`：
+  - 新增 **`OLED STAT`** 子命令，回 `OLED flush: busy=%u  dropped=%lu`。
+  - `OLED INIT` 与 `OLED CLR` 现在**同时清空 `s_oled_lines[]` 影子** ——
+    只清显存的话，下一次整屏重绘会把旧文字又带回来。
+  - **`OLED PIX` 与 `OLED BAR` 由裸 `OLED_ShowFrame()` 改为 `oled_redraw_lines()`** ——
+    否则整屏会被"空显存 + 一个矩形"覆盖掉。
+
+**验证**：`arm-none-eabi-gcc -fsyntax-only -Wall -Wextra -std=gnu11` 逐个检查
+`oled.c` / `reg_shell.c` / `main.c` / `dma.c` / `stm32f4xx_it.c` / `i2c.c` / `font.c`
+全部通过，无警告。（本会话不跑 cmake，编译由用户在 STM32CubeIDE 里做。）
+
+> ⚠ **本轮实际的刷屏机制要说清楚**：`OLED_FlushPoll()` 内部调的仍是**阻塞**的
+> `OLED_Send()`（`HAL_I2C_Master_Transmit(..., HAL_MAX_DELAY)`），**并没有真正
+> 用上 DMA**。它的效果是把"一次阻塞 92ms"拆成"每次阻塞约 2.8ms × 8 次"，
+> 由主循环分 8 遍喂完 —— 主循环的响应性大幅改善，但它不是 DMA。
+> `Core/Src/dma.c` / `Core/Src/i2c.c` 里的 `hdma_i2c2_tx`（DMA1_Stream7 / CH7 /
+> MEMORY_TO_PERIPH）与新增的两个中断目前**没有被 `oled.c` 使用**。
+> **第 2 步真正的 DMA 化仍待做**（见 §11）。
+
+同步更新 AGENTS.md §3.9 / §5 / §7.5 / §8 / §10 / §11。
+
+### 2026-02-13 — 切换到波特律动 OLED 驱动
 
 **背景**：自写的 `ssd1306.c` 能编译、I2C 扫描也能扫到 `0x3C`，但屏始终不亮，
 串口报 `[OLED] FAIL: no ACK from 0x78`。换用用户提供的第三方波特律动驱动后，
@@ -980,7 +1036,7 @@ GPIOA~GPIOK（`0x40020000`~`0x40023FFF`）与 RCC（`0x40023800`~`0x40023BFF`，
 
 | 项 | 说明 | 优先级 |
 |---|---|---|
-| **OLED 第 2 步：刷屏走中断/DMA** | 当前 `OLED_ShowFrame()` 是阻塞全屏刷 8 页，1024 字节 @100kHz ≈ 92ms，期间 `MX_LWIP_Process()` 完全停摆。`Core/Src/dma.c` + `Core/Inc/dma.h` 已由 CubeMX 生成（`hdma_i2c2_rx`=DMA1_Stream2、`hdma_i2c2_tx`=DMA1_Stream7，均 Channel 7，**与 ETH 不冲突**），但**尚未接入** | **高** |
+| **OLED 第 2 步：刷屏真正走 DMA** | 本轮已把 92ms 阻塞拆成 8×2.8ms（见 §10 与 §3.9），主循环响应性已解决，但**用的仍是阻塞 `HAL_I2C_Master_Transmit`，没上 DMA**。`hdma_i2c2_tx`=DMA1_Stream7 / CH7 / MEMORY_TO_PERIPH 已由 CubeMX 生成，`I2C2_EV_IRQHandler` 也已补上（在 `Core/Src/dma.c` / `Core/Src/stm32f4xx_it.c`），但**尚未被 `oled.c` 使用** | **高** |
 | **OLED 第 3 步：`OLED BLIT` + 动眼睛动画** | 用户目标（原话）：「在 OLED 上显示一双会动的眼睛，AI 可以通过修改寄存器等操作直接控制」。**帧缓冲上传（约 1032 字节/帧）才是可行形态，不是逐寄存器写** —— 15~30 fps × 1024 字节用 `W` 一条 4 字节要几十万条命令/秒，物理上做不到。发送侧 `Echo_Service_ReplyBoth()` 已就绪 | **高** |
 | `.mxproject` 追踪 | 见 9.3，尚未决定是否移除追踪 | 低 |
 | 改用 HSE 25MHz | 当前用 HSI ±1%，UART 波特率有偏差；RMII 参考时钟由 PHY 自己的晶振提供，不影响以太网。属可选优化 | 低 |

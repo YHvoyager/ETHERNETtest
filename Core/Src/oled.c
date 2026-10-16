@@ -58,6 +58,22 @@ extern I2C_HandleTypeDef hi2c2;
 // 显存
 uint8_t OLED_GRAM[OLED_PAGE][OLED_COLUMN];
 
+/* ===========================================================================
+ * 【本工程新增】非阻塞刷屏的状态
+ *
+ * 原版 OLED_ShowFrame() 是一口气同步发 8 页（约 92ms），把主循环里的 lwIP
+ * 饿死。这里把它拆成"每调一次推进一页"的状态机，由 main() 的 while(1) 驱动。
+ *
+ * 注意 s_flush_buf 只有 129 字节，**不是** 8 页共用的整屏缓冲：
+ * 每页发送前从 OLED_GRAM 现拷一份，所以显存可以在传输途中被安全改写
+ * （用整屏缓冲的话，中途 NewFrame + 绘制会把正在发的数据改掉）。
+ * =========================================================================== */
+static uint8_t  s_flush_buf[OLED_COLUMN + 1];
+static uint8_t  s_flush_active  = 0U;   /* 1 = 后台正在刷屏 */
+static uint8_t  s_flush_stage   = 0U;   /* 0 = 刚发完换页命令，1 = 刚发完数据 */
+static uint8_t  s_flush_page    = 0U;
+static uint32_t s_flush_dropped = 0U;
+
 // ========================== 底层通信函数 ==========================
 
 /**
@@ -134,8 +150,14 @@ void OLED_Init()
   OLED_SendCmd(0x8D);
   OLED_SendCmd(0x14);
 
+  /* 【本工程改动】原版这里是 OLED_ShowFrame()。但本工程的 OLED_ShowFrame()
+   * 已经改成异步：只发第一页的换页命令就返回，剩下 7 页要等主循环里的
+   * OLED_FlushPoll() 来推。开机时 main() 还没进主循环，这里若用异步版，
+   * 屏上就只有第一页有内容 —— 而且 s_flush_active 会一直挂着，导致紧接着
+   * 的主循环第一次 OLED_ShowFrame() 被当成"上一帧没发完"直接丢掉。
+   * 初始化阶段必须发完再往下走，所以用阻塞版。 */
   OLED_NewFrame();
-  OLED_ShowFrame();
+  OLED_ShowFrameBlocking();
 
   OLED_SendCmd(0xAF); /*开启显示 display ON*/
 }
@@ -190,8 +212,89 @@ void OLED_NewFrame()
 /**
  * @brief 将当前显存显示到屏幕上
  * @note 此函数是移植本驱动时的重要函数 将本驱动库移植到其他驱动芯片时应根据实际情况修改此函数
+ * @note 【本工程改动】原版这里是**同步**发送，8 页 × 129 字节 @100kHz 要
+ *       约 92ms，期间主循环完全停摆（lwIP 收不到包、心跳间隔抖到 1100ms+）。
+ *       现在拆成两步，本函数只把 8 页排成一条链交给后台传输，**立即返回**。
+ *       实际发送由 OLED_FlushPoll() 在 main() 主循环里推进。
+ *       要恢复原版行为（阻塞发完）就调 OLED_ShowFrameBlocking()。
  */
 void OLED_ShowFrame()
+{
+  if (s_flush_active != 0U)
+  {
+    /* 上一帧还没发完。丢掉这一帧不会画错，只是慢一帧 —— 比让调用者
+     * 阻塞 92ms 好。屏幕本来就是"最新一帧生效"，中间帧没人看。 */
+    s_flush_dropped++;
+    return;
+  }
+
+  s_flush_page = 0U;
+  s_flush_dropped = 0U;
+  s_flush_active = 1U;
+
+  /* 立刻启动第一页 —— 这样调用者返回时总线上已经有数据在动，
+   * 不需要等第一次 OLED_FlushPoll()。 */
+  s_flush_stage = 0U;
+  {
+    static uint8_t pageCmd[4] = {0x00, 0xB0, 0x00, 0x10};
+    pageCmd[1] = (uint8_t)(0xB0 + 0);
+    OLED_Send(pageCmd, 4);
+  }
+}
+
+/**
+ * @brief 推进 OLED 后台刷屏状态机（**非阻塞**，放主循环里反复调）
+ * @note  状态机：第 N 页 换页命令(带内嵌延时) -> 第 N 页数据 -> 第 N+1 页 ...
+ *        每调一次只推进一小步，最长阻塞约 2.8ms（129 字节 @100kHz）。
+ * @return 1 = 正在传输中；0 = 空闲
+ */
+uint8_t OLED_FlushPoll(void)
+{
+  if (s_flush_active == 0U)
+  {
+    return 0U;
+  }
+
+  /* hi2c2 还在忙（可能是刷屏，也可能是 PCF8574 在跑）—— 让出，下次再来。
+   * 这一句是整个方案的关键：不在这里等，主循环才有机会跑 lwIP。 */
+  if (hi2c2.State != HAL_I2C_STATE_READY)
+  {
+    return 1U;
+  }
+
+  if (s_flush_stage == 0U)
+  {
+    /* 换页命令已经发完，接着发这一页的 129 字节（0x40 控制字节 + 128 数据） */
+    s_flush_buf[0] = 0x40;
+    memcpy(s_flush_buf + 1, OLED_GRAM[s_flush_page], OLED_COLUMN);
+    OLED_Send(s_flush_buf, OLED_COLUMN + 1);
+    s_flush_stage = 1U;
+    return 1U;
+  }
+
+  /* 一页发完，准备下一页 */
+  s_flush_page++;
+  if (s_flush_page >= OLED_PAGE)
+  {
+    s_flush_active = 0U;
+    return 0U;
+  }
+
+  {
+    static uint8_t pageCmd[4] = {0x00, 0xB0, 0x00, 0x10};
+    pageCmd[1] = (uint8_t)(0xB0 + s_flush_page);
+    OLED_Send(pageCmd, 4);
+  }
+  s_flush_stage = 0U;
+  return 1U;
+}
+
+/**
+ * @brief 阻塞式刷屏（原版行为，整屏一次发完）
+ * @note  只在必须"发完再往下走"的场合用：开机画面、OLED INIT。
+ *        平时不要用 —— 它会让 lwIP 停摆约 92ms。
+ */
+void OLED_ShowFrameBlocking(void)
 {
   static uint8_t sendBuffer[OLED_COLUMN + 1];
   sendBuffer[0] = 0x40;
@@ -203,6 +306,24 @@ void OLED_ShowFrame()
     memcpy(sendBuffer + 1, OLED_GRAM[i], OLED_COLUMN);
     OLED_Send(sendBuffer, OLED_COLUMN + 1);
   }
+}
+
+/**
+ * @brief 上一帧是否还在后台发送中
+ */
+uint8_t OLED_FlushBusy(void)
+{
+  return s_flush_active;
+}
+
+/**
+ * @brief 因上一帧未发完而被丢弃的帧数（调优/排查用）
+ */
+uint32_t OLED_FlushDropped(void)
+{
+  uint32_t n = s_flush_dropped;
+  s_flush_dropped = 0U;
+  return n;
 }
 
 /**

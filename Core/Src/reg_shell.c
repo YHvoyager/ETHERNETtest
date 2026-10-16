@@ -245,6 +245,7 @@ static const char *const s_help_text =
   "  OLED REFRESH       redraw all 4 lines from the line cache\r\n"
   "  OLED PIX <x> <y> [0|1]    draw one pixel\r\n"
   "  OLED BAR <x> <y> <w> <h> [0|1]   filled rectangle\r\n"
+  "  OLED STAT          background flush state (busy / dropped frames)\r\n"
   "  OLED RAW <ctrl> <hex...>  send raw I2C bytes, bypassing the driver\r\n"
   "  BROADCAST [port]   mirror frames to a 2nd socket (0 = off)\r\n"
   "  PING               liveness check the PC can use to probe the board\r\n"
@@ -528,10 +529,15 @@ static char s_oled_txt_buf[SHELL_MAX_LINE];
 static char s_oled_lines[4][64];
 
 /**
-  * @brief  按 s_oled_lines[] 把整屏四行重画出来
+  * @brief  按 s_oled_lines[] 把整屏四行重画出来（异步刷屏）
   * @note   中文字符走 font16x16 字库（font.c 里的 zh16x16，当前只含"波特律动"
   *         4 个字）；字库里没有的字符若是 ASCII 则退化成内置 afont16x8 显示，
   *         中文则显示成空格 —— 波特律动 OLED_PrintString 内部就是这么处理的。
+  *
+  *         【为什么可以重复调用】OLED_ShowFrame() 现在是异步的：只启动第一页
+  *         就返回，剩下的靠主循环里的 OLED_FlushPoll() 送完。所以连续发几条
+  *         OLED TXT 不会各自阻塞 92ms，也不会互相打架 —— 传输中的那一帧照常
+  *         发完，新的一帧从第一页重新开始。视觉上就是"最后一次刷新生效"。
   */
 static void oled_redraw_lines(void)
 {
@@ -623,9 +629,11 @@ static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
    * 现在换成波特律动（不探测，直接写），再留这条命令作为手动补救。 */
   if (strcmp(tok[1], "INIT") == 0)
   {
-    OLED_Init();
+    OLED_Init();          /* 内部含一次阻塞刷屏，会把显存清掉 */
     OLED_NewFrame();
-    (void)snprintf(out, (size_t)out_size, "OK OLED_Init() + OLED_NewFrame()\r\n");
+    for (uint32_t i = 0U; i < 4U; i++) { s_oled_lines[i][0] = '\0'; }
+    (void)snprintf(out, (size_t)out_size,
+                   "OK OLED_Init() + cleared (flush is now async)\r\n");
     return 1;
   }
 
@@ -646,7 +654,10 @@ static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
   /* ---- OLED CLR ---- 清空显存并刷屏 */
   if (strcmp(tok[1], "CLR") == 0)
   {
+    uint32_t i;
+
     OLED_NewFrame();
+    for (i = 0U; i < 4U; i++) { s_oled_lines[i][0] = '\0'; }
     OLED_ShowFrame();
     (void)snprintf(out, (size_t)out_size, "OK OLED cleared\r\n");
     return 1;
@@ -667,7 +678,10 @@ static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
     return 1;
   }
 
-  /* ---- OLED PIX <x> <y> [0|1] ---- */
+  /* ---- OLED PIX <x> <y> [0|1] ----
+   * ⚠ 和 OLED FILL / BAR 一样：只改一个像素，但波特律动是全屏重绘模型，
+   * 所以这里也走 oled_redraw_lines() 而不是裸 OLED_ShowFrame() —— 否则
+   * 会把屏上其它内容一起按"空显存"刷掉。 */
   if (strcmp(tok[1], "PIX") == 0)
   {
     uint32_t x;
@@ -699,7 +713,7 @@ static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
 
     /* 波特律动语义：NORMAL=点亮，REVERSED=熄灭（显存里 1 是灭） */
     OLED_SetPixel((uint8_t)x, (uint8_t)y, color);
-    OLED_ShowFrame();
+    oled_redraw_lines();
 
     (void)snprintf(out, (size_t)out_size, "OK OLED (%u,%u) = %s\r\n",
                    (unsigned int)x, (unsigned int)y,
@@ -777,7 +791,9 @@ static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
     return 1;
   }
 
-  /* ---- OLED BAR <x> <y> <w> <h> [0|1] ---- 矩形，给"动眼睛"之类打底 */
+  /* ---- OLED BAR <x> <y> <w> <h> [0|1] ---- 矩形，给"动眼睛"之类打底
+   * ⚠ 与 OLED PIX 同理：走的必须是 oled_redraw_lines()，否则整屏会被
+   * "空显存 + 一个矩形"覆盖掉。 */
   if (strcmp(tok[1], "BAR") == 0)
   {
     uint32_t x, y, w, h;
@@ -801,13 +817,27 @@ static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
     }
 
     OLED_DrawFilledRectangle((uint8_t)x, (uint8_t)y, (uint8_t)w, (uint8_t)h, color);
-    OLED_ShowFrame();
+    oled_redraw_lines();
 
     (void)snprintf(out, (size_t)out_size,
                    "OK OLED bar (%u,%u) %ux%u %s\r\n",
                    (unsigned int)x, (unsigned int)y,
                    (unsigned int)w, (unsigned int)h,
                    (color == OLED_COLOR_NORMAL) ? "ON" : "OFF");
+    return 1;
+  }
+
+  /* ---- OLED STAT ---- 后台刷屏状态，调优用
+   * 【为什么需要】异步刷屏是"丢帧"策略：上一帧没发完就丢弃新帧。如果屏幕
+   * 看着更新很慢，先看这里 —— dropped 一直涨说明主循环调用 FlushPoll 的频率
+   * 跟不上发送速度（要么主循环被别的东西堵住，要么 I2C 太慢）。 */
+  if (strcmp(tok[1], "STAT") == 0)
+  {
+    (void)snprintf(out, (size_t)out_size,
+                   "OLED flush: busy=%u  dropped=%lu since last STAT\r\n"
+                   "            (async flush, 1 page per OLED_FlushPoll())\r\n",
+                   (unsigned int)OLED_FlushBusy(),
+                   (unsigned long)OLED_FlushDropped());
     return 1;
   }
 
@@ -858,7 +888,7 @@ static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
 
   (void)snprintf(out, (size_t)out_size,
                  "ERR: unknown OLED subcommand '%s'\r\n"
-                 "     try: INIT ON OFF CLR FILL PIX TXT REFRESH BAR RAW\r\n",
+                 "     try: INIT ON OFF CLR FILL PIX TXT REFRESH BAR STAT RAW\r\n",
                  tok[1]);
   return -1;
 }

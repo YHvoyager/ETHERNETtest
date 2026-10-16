@@ -164,6 +164,12 @@ int main(void)
   HAL_Delay(100);
 
   OLED_Init();
+
+  /* 【开机画面为什么用阻塞版】
+   * OLED_ShowFrame() 现在是异步的（只启动第一页就返回），本意是别让刷屏
+   * 卡住 lwIP。但开机这一刻还没有网络要伺候，用阻塞版反而更简单：
+   * 画完就完整显示在屏上，不用等主循环来推进。
+   * 主循环一旦跑起来，后面所有 OLED 命令走的都是异步版。 */
   OLED_NewFrame();
 
   /* 波特律动的打印函数形参是 char*（非 const），字面量要转一下。
@@ -180,7 +186,7 @@ int main(void)
     OLED_PrintASCIIString(0U, 48U, l3, &afont16x8, OLED_COLOR_NORMAL);
   }
 
-  OLED_ShowFrame();
+  OLED_ShowFrameBlocking();
   printf("[OLED] boot screen drawn (BaudDance driver, I2C2 PH4/PH5)\r\n");
   /* USER CODE END 2 */
 
@@ -194,6 +200,13 @@ int main(void)
     MX_LWIP_Process();
 
     Echo_Service_Poll();   /* 非阻塞，内部 1 秒节流；只在收到过包之后才发 */
+
+    /* 推进 OLED 后台刷屏，每步 ≤ 约 2.8ms。
+     *
+     * 【为什么必须放在主循环里】OLED_ShowFrame() 现在只启动第一页就返回，
+     * 剩下的 7 页靠这里一句一句喂完。少了这一句，整屏只会送出第一页，
+     * 屏上会是"第一行对、下面全乱"。 */
+    OLED_FlushPoll();
   }
   /* USER CODE END 3 */
 }

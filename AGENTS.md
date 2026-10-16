@@ -103,6 +103,8 @@ arm-none-eabi-objcopy.exe -O ihex build/Debug/ETHERNETtest.elf build/Debug/ETHER
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/debug_uart.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/eth_phy.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/board_io.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/reg_shell.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/echo_service.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/udp_echo.c
 )
@@ -125,12 +127,16 @@ ETHERNETtest/
 │   ├── Inc/
 │   │   ├── eth_phy.h          板级补丁接口（3 函数）
 │   │   ├── debug_uart.h       printf 重定向接口
+│   │   ├── board_io.h         板级 IO 注册表接口（DS0/DS1）
+│   │   ├── reg_shell.h        ★ 以太网命令接口（LED / R / W）
 │   │   ├── echo_service.h     带话术的回声服务接口（**当前启用**）
 │   │   ├── udp_echo.h         UDP 原样回环接口（保留，未启用）
 │   │   ├── main.h / i2c.h / usart.h / gpio.h / stm32f4xx_it.h / stm32f4xx_hal_conf.h
 │   └── Src/
 │       ├── eth_phy.c          ★ 板级补丁（MspInit + PHY 复位 + PHY 准备 + 诊断）
-│       ├── echo_service.c     ★ 带话术的 UDP 回声（当前启用的应用）
+│       ├── board_io.c         ★ 板级 IO 注册表（扩展点：加一行就多一个可控 IO）
+│       ├── reg_shell.c        ★ 命令解析 + 寄存器读写地址白名单
+│       ├── echo_service.c     ★ 带话术的 UDP 回声 + 命令分发（当前启用的应用）
 │       ├── udp_echo.c         UDP 原样回环（保留，未启用，端口与上面冲突）
 │       ├── debug_uart.c       printf → USART1
 │       ├── main.c             初始化顺序 + 主循环
@@ -155,7 +161,9 @@ ETHERNETtest/
 |---|---|---|
 | `Core/Src/eth_phy.c` | 把 CubeMX 漏掉的三件事集中于此 | **本工程最重要的文件** |
 | `Core/Src/main.c` | 初始化顺序（**不能改**） | 见 3.3 |
-| `Core/Src/echo_service.c` | **当前启用的应用**：UDP 8080 带话术回声 + 每秒心跳 | 见 3.5 |
+| `Core/Src/board_io.c` | 板级 IO 注册表（DS0/DS1） | **扩展点**，见 3.6 |
+| `Core/Src/reg_shell.c` | 命令解析 + 寄存器读写白名单 | 见 3.7 |
+| `Core/Src/echo_service.c` | **当前启用的应用**：UDP 8080 回声 + 心跳 + 命令分发 | 见 3.5 |
 | `Core/Src/udp_echo.c` | UDP 8080 原样回环 + 每秒心跳 | **未启用**，端口与上面冲突 |
 | `LWIP/App/lwip.c` | `gnetif` 定义（`:45`）、IP 配置（`:63-66`） | |
 | `LWIP/Target/ethernetif.c` | 网卡驱动，5 处手工改动 | 见 3.4 |
@@ -261,6 +269,129 @@ while (1)
 > 等于半个栈，加上 `printf` 的调用深度就危险了。该缓冲只在主循环上下文使用，
 > 不存在重入，static 是安全的。`s_rx_raw` 同理（原先它是个 261 字节的栈数组
 > `char text[ECHO_MAX_PAYLOAD + 1U]`，一并挪到了 static）。
+
+### 3.6 `board_io.c` —— 板级 IO 注册表（扩展点）
+
+**这是个表，不是逻辑。** 目的是把"板上有哪些可控 IO"和"怎么解析命令"彻底分开：
+将来加一个 LED / 继电器 / 蜂鸣器，**只在这张表里加一行**，命令解析、帮助文本、
+大小写处理全都不用动。
+
+**接口**（`Core/Inc/board_io.h`）：
+
+| 函数 | 职责 |
+|---|---|
+| `Board_IO_Init(void)` | 初始化表里所有 IO 的硬件（时钟 + 输出电平） |
+| `Board_IO_Count(void)` | 表项数量 |
+| `Board_IO_Get(size_t idx, ...)` | 按下标取名字 + 当前电平 |
+| `Board_IO_Find(const char *name)` | 按名字查下标（**大小写不敏感，`-`/`_` 等价**），找不到返回 `-1` |
+| `Board_IO_Write(size_t idx, int level)` | 写电平，**同时更新影子变量** |
+| `Board_IO_Toggle(size_t idx)` | 翻转 |
+| `Board_IO_ReadRaw(size_t idx)` | 读**实际引脚**电平（与影子对照可验证写入是否真的生效） |
+
+**表项结构**（`Core/Src/board_io.c`）：
+
+```c
+typedef struct {
+    const char *name;       /* "DS0" */
+    GPIO_TypeDef *port;     /* GPIOB */
+    uint16_t pin;           /* GPIO_PIN_0 */
+    uint8_t active_low;     /* 1 = 低电平点亮 */
+    uint8_t cur_level;      /* 影子：当前"点亮/熄灭"逻辑电平 */
+} board_io_t;
+```
+
+**当前表内容**：
+
+| 名字 | 引脚 | 有效电平 | 说明 |
+|---|---|---|---|
+| `DS0` | `PB0` | 低电平点亮（`active_low=1`） | 正点原子阿波罗V2 板载 LED0 |
+| `DS1` | `PB1` | 低电平点亮（`active_low=1`） | 正点原子阿波罗V2 板载 LED1 |
+
+**两个关键设计**：
+
+1. **`active_low` 抽象**：命令层说"点亮/熄灭"，表里翻译成引脚电平。扩展时
+   遇到高电平有效的器件（如继电器）只需填 `active_low=0`，命令语义不变。
+2. **影子变量 `cur_level`**：`Board_IO_Write()` 既写引脚也记下逻辑电平，于是
+   `LED` 查询、`TOGGLE` 翻转都不需要回读引脚。`Board_IO_ReadRaw()` 保留下来
+   专门用于对照验证（影子说亮、引脚却是灭 → 说明配置错了）。
+
+> ⚠ **PB0/PB1 在 CubeMX 里原本是 ETH 的备用引脚还是普通 GPIO，以 `.ioc` 为准。**
+> 若 CubeMX 重新生成后 `MX_GPIO_Init()` 不再初始化 PB0/PB1，`Board_IO_Init()`
+> 会自己配一次（内部调用 `__HAL_RCC_GPIOB_CLK_ENABLE()` + `HAL_GPIO_Init()`），
+> 不依赖 CubeMX 生成代码 —— 这样重新生成也不会失效。
+
+### 3.7 `reg_shell.c` —— 以太网命令接口
+
+**功能**：把 UDP 收到的**文本**当作命令行解析，执行后把结果组包回给发信人。
+这是"AI 通过以太网操作单片机"的入口。
+
+**命令表**：
+
+| 命令 | 语法 | 作用 |
+|---|---|---|
+| `HELP` / `?` | `HELP` | 打印命令表与当前 IO 状态 |
+| `LED` | `LED` | 列出所有可控 IO 及其状态 |
+| | `LED DS0 1` / `LED DS0 0` | 点亮 / 熄灭 DS0（`ON`/`OFF`/`HIGH`/`LOW` 也接受） |
+| | `LED DS0 TOGGLE` | 翻转 DS0 |
+| `R` | `R <addr> <count>` | 读寄存器，addr/count 都是**十六进制**，count 上限 16 |
+| `W` | `W <addr> <value>` | 写 32 位寄存器，addr/value 都是**十六进制** |
+
+**`R`/`W` 的地址白名单（安全边界，极其重要）**：
+
+`R`/`W` 能读写任意 32 位地址，等于把整颗芯片的控制权交出去。若不加限制，
+一句 `W 40023800 0`（RCC 时钟寄存器）就能把板子写砖，或写坏 Flash/外设配置。
+所以 `reg_shell.c` 开头有一张**显式白名单**，只有落在白名单里的地址才允许访问，
+其实现方式是**地址范围表 + 逐项比对**，命中范围外的地址一律回
+`[ERR] address 0x........ is not in the allow-list`。
+
+**当前白名单**：
+
+| 范围 | 含义 |
+|---|---|
+| `0x40020000` ~ `0x40023FFF` | GPIOA~GPIOK 外设寄存器 |
+| `0x40023800` ~ `0x40023BFF` | RCC —— ⚠ **只读，禁止写**（写 RCC 会掉时钟/变砖） |
+
+> **要加新的可访问外设，就在白名单表里加一行范围**，不要放开整片 `0x40000000`。
+> 宁可"加一次改一次"，也不要一个能写坏板子的万能后门。
+
+**其他实现要点**：
+
+- **解析大小写不敏感**，`led ds0 on` == `LED DS0 ON`。
+- **回包缓冲与回声服务一样是 static**（`s_reply[REG_SHELL_REPLY_MAX]`，栈只有 1024 字节）。
+- **超长的 `W` 值会被拒**（`parse_hex32()` 溢出检测），不静默截断。
+- **越界地址在真正读写前就拦住**，不是先读了再判断。
+- 命令处理是**纯函数式**的：`Reg_Shell_Execute(const char *cmd, char *out, size_t out_size)`
+  返回 `0` 成功、非 0 失败，不直接调 `udp_sendto()`。这样将来换传输方式
+  （TCP / 串口 / 甚至 MQTT）都不用改 `reg_shell.c`。
+
+### 3.8 命令分发是怎么接进回声服务的
+
+`Core/Src/echo_service.c` 的回调里**先看内容再决定怎么答**：
+
+```
+收到 UDP 包
+   │
+   ├─ 以 "ECHO " 或 "echo " 开头 ──→ 走原来的中文话术回显
+   │
+   └─ 否则 ──→ 交给 Reg_Shell_Execute() 当命令解析
+                 │
+                 ├─ 返回 0 ──→ 回显执行结果
+                 └─ 返回非0 ──→ 回显 "[ERR] unknown command ..." + HELP 提示
+```
+
+**为什么要一个 `ECHO ` 前缀**：不加前缀的话，"hello" 这种普通测试文本会被
+当成未知命令回错误，原来的回声测试就没法用了。加前缀让两种用法共存：
+
+| 你发的内容 | 板子的回答 |
+|---|---|
+| `ECHO hello` | `我收到你的信息了，是"hello"吗？` |
+| `LED DS0 1` | `[OK] DS0 (PB0) = ON` |
+| `LED` | 列出 DS0/DS1 状态 |
+| `R 40020014 2` | 读 GPIOB 的 ODR/... 十六进制值 |
+| `hello` | `[ERR] unknown command: hello` + HELP 提示 |
+
+> **触发心跳的行为不变**：任何来包都会更新"最近一次来包的 PC"，所以命令
+> 发过一次之后，心跳仍会每秒推给那台 PC。
 
 ---
 
@@ -400,10 +531,37 @@ ping 192.168.1.30
 
 | 操作 | 期望 |
 |---|---|
-| 发送 `hello` | 立刻收到 `hello` |
-| 不发任何东西 | 仍每秒收到 `STM32F429 alive, tick=..., rx=...` |
+| 发送 `ECHO hello` | 立刻收到 `我收到你的信息了，是"hello"吗？` |
+| 发送 `hello`（无前缀） | `[ERR] unknown command: hello` + HELP 提示 |
+| 不发任何东西 | 仍每秒收到中文心跳 |
 
 > **心跳间隔必须稳定 1000ms。** 变成 64 秒说明主循环被卡住。
+
+> ⚠ **`ECHO ` 前缀不能省**（见 §3.8）。不带前缀的普通文本现在会被当命令，
+> 得到 `[ERR] unknown command`。这是改用命令接口后的**行为变更**。
+
+### 7.5 命令接口实测（当前主功能）
+
+配置同上，发 **文本命令**，逐条核对：
+
+| 发这条 | 期望回包 | 现象 |
+|---|---|---|
+| `LED` | 列出 `DS0`/`DS1` 及状态 | — |
+| `LED DS0 1` | `[OK] DS0 (PB0) = ON` | **板载 LED0 亮** |
+| `LED DS0 0` | `[OK] DS0 (PB0) = OFF` | **板载 LED0 灭** |
+| `LED DS1 1` | `[OK] DS1 (PB1) = ON` | **板载 LED1 亮** |
+| `LED DS0 TOGGLE` | `[OK] DS0 (PB0) = ...` | LED0 翻转 |
+| `R 40020014 1` | `0x........` 十六进制 | 读 GPIOB ODR |
+| `W 40020014 1` 后再 `R` | 值变了 | 直接写寄存器 |
+| `W 40023800 0` | `[ERR] ... not writable` | **白名单拦住写 RCC** |
+| `HELP` | 命令表 | — |
+
+**验收标准**：发 `LED DS0 1` 后**板载 LED0 真的亮**，发 `LED DS0 0` 后真的灭，
+且串口日志同步打印 `[CMD] ...`。
+
+> **影子与实测对照**：若回包说 `ON` 但灯不亮，用 `R 40020014 1` 读 GPIOB 的 ODR
+> 看 bit0 是不是 0。bit0=0 而灯不亮 → 引脚/硬件问题；bit0=1 → `Board_IO_Write()`
+> 没真的写进去。这比盯着灯猜快得多。
 
 ---
 
@@ -426,6 +584,11 @@ ping 192.168.1.30
 | **回显的原文全变成 `.`** | `sanitize_inplace()` 把 ≥0x80 的字节也滤了 | 判据必须只有 `c < 0x20`；UTF-8 汉字每字节都 ≥0x80 |
 | **中文回显成乱码/替换符** | 截断砍断了多字节字符 | 用 `utf8_trim_incomplete()` 回退到字符边界 |
 | **想知道 PC 到底发的什么编码** | 缺原始字节观察手段 | 把 `udp_echo.c` 的 `UDP_ECHO_HEXDUMP` 置 1，看 `[UDP] raw` 行 |
+| **命令回 `[ERR] unknown command`** | 忘了 `ECHO ` 前缀 / 命令拼错 | 普通文本要写 `ECHO xxx`；命令看 `HELP`（见 §3.8） |
+| **`LED DS0 1` 回了 OK 但灯不亮** | 引脚配置错 / 影子与硬件不符 | 用 `R 40020014 1` 读 GPIOB ODR，看 bit0 是否为 0 |
+| **命令回了 `not in the allow-list`** | 地址不在白名单 | 只有 GPIOA~K 和 RCC 允许；加外设要改 §3.7 的白名单表 |
+| **`W 40023800 ...` 被拒** | RCC 是只读项 | **这是设计如此**，写 RCC 会掉时钟/变砖 |
+| **串口没有 `[CMD]` 日志** | `echo_service.c` 分发没接上 | 检查回调里的前缀判断（见 §3.8） |
 
 ---
 
@@ -482,6 +645,44 @@ clangd `.cache/`、`__pycache__/`、OS 垃圾文件。
 ## 10. 变更日志
 
 > **每次改动代码后在此追加一条，最新的在最上面。**
+
+### 2026-02-13 — 以太网命令接口 + 板级 IO 注册表（本提交）
+
+> **本条写入时代码尚未编译验证**（§0 要求先写文档再 commit）。烧写后请按 §7.5 逐条核对。
+
+**目标**（用户原话）：留一个可以通过以太网改单片机寄存器的接口，后期能靠 AI 传数据
+改寄存器实现功能；**第一步先做"传数据点亮/熄灭 DS0、DS1"**。
+
+**新增文件**：
+
+- `Core/Inc/board_io.h` + `Core/Src/board_io.c` —— 板级 IO 注册表。
+  表项 `{name, port, pin, active_low, cur_level}`，当前两项：`DS0`=PB0、`DS1`=PB1，
+  都按正点原子阿波罗V2 的**低电平点亮**填 `active_low=1`。
+  对外 7 个函数：`Board_IO_Init/Count/Get/Find/Write/Toggle/ReadRaw`。
+  **扩展方式：表里加一行。** 命令解析、帮助文本都不需要动。
+- `Core/Inc/reg_shell.h` + `Core/Src/reg_shell.c` —— 命令解析 + 地址白名单。
+  `Reg_Shell_Execute(cmd, out, out_size)` 是**纯函数**，不碰网络，方便换传输方式。
+  支持 `HELP` / `LED` / `R` / `W`，解析大小写不敏感。
+
+**改动文件**：
+
+- `Core/Src/echo_service.c` —— 回调里加**分发**：以 `ECHO ` 开头走原来的中文回显，
+  否则交给 `Reg_Shell_Execute()`（见 §3.8）。
+- `Core/Src/main.c` —— `MX_GPIO_Init()` 之后加 `Board_IO_Init()`（让它自己在
+  `MX_LWIP_Init()` 之前把 PB0/PB1 配好，不依赖 CubeMX 生成代码）。
+- `CMakeLists.txt` —— `target_sources()` 登记 `board_io.c`、`reg_shell.c`。
+
+**为什么 `R`/`W` 一定要白名单**：这两个命令能读写任意 32 位地址，等于把整颗芯片
+交出去。一句 `W 40023800 0` 就能掉时钟/变砖。当前只放行
+GPIOA~GPIOK（`0x40020000`~`0x40023FFF`）与 RCC（`0x40023800`~`0x40023BFF`，**只读**）。
+**要加外设就往白名单表里加一行，不要放开整片 `0x40000000`。**
+
+**行为变更（重要）**：`ECHO ` 前缀现在是必需的。以前发什么回什么，现在不带前缀
+的文本会被当命令，回 `[ERR] unknown command: xxx`。这是为了让"回声测试"和
+"命令接口"共存所付的代价。
+
+同步更新 AGENTS.md §2.4 / §3 结构树 / §3.1 / §3.6 / §3.7 / §3.8 / §5 / §7.4 /
+§7.5 / §8 / §11 / §12。
 
 ### 2026-02-13 — `5f770d9` 回声服务支持中文
 

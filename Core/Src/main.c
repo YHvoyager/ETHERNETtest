@@ -27,6 +27,7 @@
 /* USER CODE BEGIN Includes */
 #include "debug_uart.h"
 #include "eth_phy.h"
+#include "board_io.h"       /* 板级 IO 注册表（DS0/DS1） */
 #include "echo_service.h"   /* 带话术的回声服务（当前启用） */
 #include "udp_echo.h"       /* 原样回环（保留，未启用，端口与上面冲突） */
 /* gnetif 定义在 LWIP/App/lwip.c，但 lwip.h 没有 extern 它，这里自己声明 */
@@ -100,6 +101,12 @@ int main(void)
   /* USER CODE BEGIN 2 */
   Debug_UART_Banner("ETHERNETtest boot (step 3: lwip)");
   printf("[OK] printf redirect works\r\n");
+
+  /* 板级 IO（DS0=PB0 / DS1=PB1，低电平点亮）。必须在 MX_GPIO_Init() 之后
+   * —— GPIO 时钟由它使能。放这里是因为它和网络无关，早配早干净：
+   * 上电后 LED 立刻处于"灭"的确定状态，而不是保持复位后的 ODR=0（对低电平
+   * 点亮的灯来说 ODR=0 就是亮）。 */
+  Board_IO_Init();
 
   /* 【关键顺序】PHY 复位必须先释放，否则 MX_LWIP_Init() 内部的 HAL_ETH_Init()
    * 会对着一个没上电的 PHY 返回"成功"，然后你就得到一个永远 ping 不通的 lwIP。 */

@@ -27,6 +27,7 @@
  */
 
 #include "echo_service.h"
+#include "reg_shell.h"      /* 以太网命令：LED / R / W */
 
 #include "lwip/udp.h"
 #include "lwip/pbuf.h"
@@ -77,6 +78,9 @@ static uint32_t  s_last_beat_tick = 0U;
 
 /** 收包计数，方便肉眼确认"到底收到没有" */
 static uint32_t  s_rx_count = 0U;
+
+/** 命令执行计数，用于心跳里汇报"AI 调了多少条命令" */
+static uint32_t  s_cmd_count = 0U;
 
 /**
  * 组包用的缓冲。
@@ -292,7 +296,30 @@ static void echo_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 
   text = s_rx_raw;
 
-  /* ---- 4. 组装中文应答 ---- */
+  /* ---- 4. 先看看是不是一条命令 ----
+   * Reg_Shell_Exec() 返回 1/-1 表示"这是命令"（1 成功，-1 参数错/被拒绝），
+   * 返回 0 表示"首关键字不认识，不是命令"，那就往下走原来的中文回声。
+   *
+   * 注意这里传的是**原始字节**（拷贝还在 s_rx_raw 里、已 sanitize），
+   * 以及 p->tot_len 而不是 full_len —— 命令不该被 Unicode 边界回退影响，
+   * 超长命令由 Reg_Shell_Exec 内部按 SHELL_MAX_LINE 拒绝。 */
+  {
+    int rc = Reg_Shell_Exec(s_rx_raw, (uint32_t)copy_len, s_tx_buf, ECHO_TX_BUF_SIZE);
+
+    if (rc != 0)
+    {
+      s_cmd_count++;
+
+      printf("[CMD] #%lu %s", (unsigned long)s_cmd_count, s_rx_raw);
+      printf("[CMD]     -> %s", s_tx_buf);
+
+      (void)send_to_peer(s_tx_buf, strlen(s_tx_buf));
+      pbuf_free(p);
+      return;
+    }
+  }
+
+  /* ---- 5. 组装中文应答 ---- */
   n = snprintf(s_tx_buf, sizeof(s_tx_buf),
                "\xE6\x88\x91\xE6\x94\xB6\xE5\x88\xB0\xE4\xBD\xA0\xE7\x9A\x84"
                "\xE4\xBF\xA1\xE6\x81\xAF\xE4\xBA\x86\xEF\xBC\x8C\xE6\x98\xAF"
@@ -308,7 +335,7 @@ static void echo_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     n = (int)sizeof(s_tx_buf) - 1;   /* snprintf 被截断时返回的是"本该写多少" */
   }
 
-  /* ---- 4. 串口打印，方便对照 ---- */
+  /* ---- 5. 串口打印，方便对照 ---- */
   printf("[ECHO] #%lu recv %u byte(s) from %u.%u.%u.%u:%u\r\n",
          (unsigned long)s_rx_count,
          (unsigned int)p->tot_len,
@@ -326,7 +353,7 @@ static void echo_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
            (full_len < copy_len) ? " (trimmed back to a character boundary)" : "");
   }
 
-  /* ---- 5. 发回去 ---- */
+  /* ---- 6. 发回去 ---- */
   (void)send_to_peer(s_tx_buf, (size_t)n);
 
   /* 收包必须由回调释放 */
@@ -342,6 +369,7 @@ int Echo_Service_Init(void)
   ip_addr_t bind_addr;
 
   s_rx_count = 0U;
+  s_cmd_count = 0U;
   s_have_peer = 0U;
   s_peer_port = 0U;
   s_last_beat_tick = HAL_GetTick();
@@ -376,6 +404,7 @@ int Echo_Service_Init(void)
          (unsigned int)ip4_addr3(ip_2_ip4(&gnetif.ip_addr)),
          (unsigned int)ip4_addr4(ip_2_ip4(&gnetif.ip_addr)));
   printf("[ECHO] send anything, board replies: \"...\" is what I got\r\n");
+  printf("[ECHO] or send a command: LED0 / LED 1 1 / IO / R 40020014 / W 40020014 3 / HELP\r\n");
 
   return 0;
 }
@@ -396,11 +425,14 @@ void Echo_Service_Poll(void)
   {
     s_last_beat_tick = HAL_GetTick();
 
-    /* 心跳也用中文，保持界面风格一致 */
+    /* 心跳也用中文，保持界面风格一致；顺带汇报命令条数，方便判断 AI 那边的指令
+     * 到底有没有送达（rx 涨了但 cmd 不涨 = 命令关键字没被认出来）。 */
     n = snprintf(s_tx_buf, sizeof(s_tx_buf),
                  "STM32F429 \xE5\x9C\xA8\xE7\xBA\xBF\xEF\xBC\x8C"      /* 在线， */
-                 "\xE5\xB7\xB2\xE6\x94\xB6 %lu \xE6\x9D\xA1\r\n",       /* 已收 N 条 */
-                 (unsigned long)s_rx_count);
+                 "\xE5\xB7\xB2\xE6\x94\xB6 %lu \xE6\x9D\xA1\xEF\xBC\x8C" /* 已收 N 条， */
+                 "\xE5\x91\xBD\xE4\xBB\xA4 %lu \xE6\x9D\xA1\r\n",         /* 命令 M 条 */
+                 (unsigned long)s_rx_count,
+                 (unsigned long)s_cmd_count);
     if (n > 0)
     {
       if ((size_t)n >= sizeof(s_tx_buf))

@@ -898,6 +898,54 @@ clangd `.cache/`、`__pycache__/`、OS 垃圾文件。
 
 > **每次改动代码后在此追加一条，最新的在最上面。**
 
+### 2026-02-13 — 修 `--check` / `--test` 被 API key 挡住
+
+**现象**（用户实测，`pc_agent/agent.py` 第一次真正跑）：
+
+```
+C:\...\ETHERNETtest>python pc_agent\agent.py check
+[agent] 出错：没有配置 API key。请设置环境变量 DEEPSEEK_API_KEY，例如：
+    set DEEPSEEK_API_KEY=sk-xxxx
+（没配也能用：--anim 播内置动画，--code 播你自己的代码）
+```
+
+`check` 只是 ping 板子看在线不在线，**跟 LLM 一点关系都没有**，却退出在 key 检查上。
+`--list` / `--test` 同理。
+
+**根因**：`main()` 的分派里 `--test` 被误接给了 `_cmd_play()`，而
+`_cmd_play()` 第一行就是 `_make_renderer(args)` → `_resolve_code()` →
+`code_for()` → `_llm_config()`，于是读 key 失败、抛 `LLMError`、被
+`__main__` 的 `except (SandboxError, LLMError)` 打印退出。
+
+`_cmd_check()` 和 `_cmd_list()` 本身**不碰 LLM**，它们的 return 在 `main()`
+里也排在前面 —— 之所以还是被拦，是因为 `main()` 顺序里 `--check` / `--list`
+的判断在 `--test` 之前，但它们各自 return 到的是**正确**的函数；
+真正被 key 卡住的是原先 `if args.test: return _cmd_play(args)` 这一支。
+
+**修法**：
+
+- 新增 `_cmd_sandbox_test()` —— 只调 `self_test()`，不建 `Board`、不建
+  `Renderer`、不读 key。
+- `main()` 里 `--test` 改接 `_cmd_sandbox_test()`。
+- 从 `_cmd_play()` 里删掉那段 `if args.test:` 分支（它已经进不去了）。
+
+**规矩（写 CLI 时记住）**：**读取外部配置（API key、配置文件）必须发生在
+真正需要它的那一刻，不能放在所有命令的公共入口。** 否则每加一个不需要
+网络的子命令（`--list` / `--test` / `--check`），都要它陪绑一次 key 检查。
+`--check` 的价值恰恰是"网络没配好时告诉我哪里不对"，它自己先因为没配 key
+而死掉，就完全失去意义了。
+
+**验证**（无 key、无板子的环境下）：
+
+| 命令 | 期望 | 实测 |
+|---|---|---|
+| `python pc_agent/agent.py --list` | 列出 5 个内置动画 | ✅ |
+| `python pc_agent/agent.py --test` | `沙箱自检：10/10 拦住` | ✅ |
+| `python pc_agent/agent.py --check` | 不报 key，直接 ping，超时后给排查清单 | ✅ exit 1（板子未烧新固件） |
+
+> ⚠ 中文在这三条输出里是乱码，**那是 PowerShell 控制台的 GBK 编码显示问题，
+> 不是程序问题**（`chcp 65001` 可解决）。
+
 ### 2026-02-13 — 勾上 I2C2 NVIC 后修复重复定义 + 二次覆盖
 
 **背景**：用户在 CubeMX 的 NVIC 页勾上了 I2C2 的中断并重新生成，导致又一次覆盖。

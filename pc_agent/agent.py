@@ -526,17 +526,18 @@ def _save_png(frame: bytes, path: str) -> None:
         f.write(png)
 
 
+def _cmd_sandbox_test() -> int:
+    """只跑沙箱自检，不联网、不碰 LLM、不需要 API key。"""
+    ok, total = self_test()
+    print("[agent] 沙箱自检：%d/%d 拦住" % (ok, total))
+    if ok != total:
+        print("[agent] ⚠ 沙箱有漏，先别让 LLM 写代码")
+        return 1
+    return 0
+
+
 def _cmd_play(args) -> int:
     fn, what = _make_renderer(args)
-
-    if args.test:
-        # 只做沙箱自检，不联网
-        ok, total = self_test()
-        print("[agent] 沙箱自检：%d/%d 拦住" % (ok, total))
-        if ok != total:
-            print("[agent] ⚠ 沙箱有漏，先别让 LLM 写代码")
-            return 1
-        return 0
 
     board = None
     if not args.ascii_ and not args.dry:
@@ -647,7 +648,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.render:
         return _cmd_render(args)
     if args.test:
-        return _cmd_play(args)
+        return _cmd_sandbox_test()
 
     return _cmd_play(args)
 

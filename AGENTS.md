@@ -105,6 +105,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/eth_phy.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/board_io.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/reg_shell.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/ssd1306.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/echo_service.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/udp_echo.c
 )
@@ -128,14 +129,16 @@ ETHERNETtest/
 │   │   ├── eth_phy.h          板级补丁接口（3 函数）
 │   │   ├── debug_uart.h       printf 重定向接口
 │   │   ├── board_io.h         板级 IO 注册表接口（DS0/DS1）
-│   │   ├── reg_shell.h        ★ 以太网命令接口（LED / R / W）
+│   │   ├── reg_shell.h        ★ 以太网命令接口（LED / R / W / OLED）
+│   │   ├── ssd1306.h          ★ SSD1306 128x64 OLED 驱动接口
 │   │   ├── echo_service.h     带话术的回声服务接口（**当前启用**）
 │   │   ├── udp_echo.h         UDP 原样回环接口（保留，未启用）
 │   │   ├── main.h / i2c.h / usart.h / gpio.h / stm32f4xx_it.h / stm32f4xx_hal_conf.h
 │   └── Src/
 │       ├── eth_phy.c          ★ 板级补丁（MspInit + PHY 复位 + PHY 准备 + 诊断）
 │       ├── board_io.c         ★ 板级 IO 注册表（扩展点：加一行就多一个可控 IO）
-│       ├── reg_shell.c        ★ 命令解析 + 寄存器读写地址白名单
+│       ├── ssd1306.c          ★ OLED 驱动（帧缓冲 + 脏页刷新 + 8x16 ASCII 字库）
+│       ├── reg_shell.c        ★ 命令解析 + 寄存器读写地址白名单 + OLED 命令
 │       ├── echo_service.c     ★ 带话术的 UDP 回声 + 命令分发（当前启用的应用）
 │       ├── udp_echo.c         UDP 原样回环（保留，未启用，端口与上面冲突）
 │       ├── debug_uart.c       printf → USART1
@@ -234,6 +237,28 @@ while (1)
 |---|---|
 | `Echo_Service_Init(void)` | `udp_new()` + `udp_bind(0.0.0.0, ECHO_SERVICE_PORT)` + `udp_recv()` |
 | `Echo_Service_Poll(void)` | 每秒向"最近一次来包的 PC"推中文心跳，非阻塞 |
+| `Echo_Service_Reply(msg,len)` | 把文本回给最后来包的 PC —— **命令实现用它回包** |
+| `Echo_Service_ReplyRaw(data,len)` | 同上，但语义是二进制 |
+| `Echo_Service_ReplyBoth(data,len)` | 大帧：同时发给命令来源和 `BROADCAST` 订阅端口 |
+| `Echo_Service_ReplyChunked(data,len,mtu)` | 按 mtu 切片逐片发（给"必须完整送达"的场景） |
+| `Echo_Service_SetBroadcast(ip,port)` | 设置/关闭大帧的第二发送目标；`ip=NULL,port≠0` = 用当前 peer |
+
+**分层发送**（新加的能力，见 §5 决策表）：
+
+```
+命令处理（reg_shell.c）
+    └─ Echo_Service_Reply()          短应答：走 s_tx_buf → send_to_peer()
+    └─ Echo_Service_ReplyBoth()      大帧：两路都发
+            ├─ send_to_peer()        普通回包（最后来包的 PC）
+            └─ send_raw()            直发 s_bcast_ip:s_bcast_port
+                      ▲
+       send_to_addr() ─┘ 拷进 s_tx_buf 再走 send_raw
+                      ▲
+            send_raw()  ← 最底层：不拷贝、不截断，len 上限 u16_t
+```
+
+> **为什么 `send_to_peer()` 挡在 512 字节**：它复用 `s_tx_buf`，
+> 而 `ECHO_TX_BUF_SIZE` 就是 512。要发更大的东西必须走 `send_raw()`。
 
 **关键常量**（`Core/Src/echo_service.c`）：
 
@@ -335,6 +360,8 @@ typedef struct {
 | | `LED DS0 TOGGLE` | 翻转 DS0 |
 | `R` | `R <addr> <count>` | 读寄存器，addr/count 都是**十六进制**，count 上限 16 |
 | `W` | `W <addr> <value>` | 写 32 位寄存器，addr/value 都是**十六进制** |
+| `BROADCAST` | `BROADCAST [port]` | 大帧回包另发一份到这个端口（`0` = 关） |
+| `PING` | `PING` | 回 `PONG tick=...`，最便宜的"活着吗"探测 |
 
 **`R`/`W` 的地址白名单（安全边界，极其重要）**：
 
@@ -456,6 +483,10 @@ RMII     : PA1 REF_CLK, PA2 MDIO, PA7 CRS_DV, PC1 MDC,
 | **截断回退到字符边界（`utf8_trim_incomplete()`）** | 3 字节的汉字被硬砍成 1~2 字节就不是合法 UTF-8，助手显示成替换符 |
 | **原始字节先收进 `s_rx_raw` 再在副本上加工** | 先截断+过滤会破坏原始数据，事后无法再判断"PC 到底发的什么编码" |
 | **`UDP_ECHO_HEXDUMP` 默认 0** | 115200 下打 32 字节的十六进制要 99 字符≈8.6ms，收包频繁时拖慢主循环 |
+| **发送分三层（`send_raw` / `send_to_addr` / `send_to_peer`）** | 上层短应答要的是"安全截断"，底层大帧要的是"一个字节都不能少"。混成一个函数必然二选一 |
+| **大帧同时发两路（`ReplyBoth`），不切片** | 一条 UDP 最大 1472 字节，1472 字节在 100M 链路上只要约 0.1ms。**切片没有收益**，真正的瓶颈是 I2C（1024 字节 @100kHz ≈ 100ms） |
+| **`send_raw()` 不做任何拷贝** | 960 字节的帧拷一遍就要 `PBUF_POOL_SIZE × PBUF_POOL_BUFSIZE` = 4×1524 = 6096 字节的池里再占一块，多一次 `memcpy` 没有意义 |
+| **`BROADCAST` 只改"第二路目标"，不动 peer** | 保持心跳和普通回包仍指向"最后来包的 PC"，不因为设了广播就改变主链路 |
 
 ### 5.1 MDIO 地址扫描的假阳性（重要）
 
@@ -552,6 +583,8 @@ ping 192.168.1.30
 | `LED DS1 1` | `[OK] DS1 (PB1) = ON` | **板载 LED1 亮** |
 | `LED DS0 TOGGLE` | `[OK] DS0 (PB0) = ...` | LED0 翻转 |
 | `R 40020014 1` | `0x........` 十六进制 | 读 GPIOB ODR |
+| `PING` | `PONG tick=...` | 最便宜的"活着吗"探测 |
+| `BROADCAST 8081` | 设成功提示 | 之后的大帧另发一份到 `192.168.1.100:8081` |
 | `W 40020014 1` 后再 `R` | 值变了 | 直接写寄存器 |
 | `W 40023800 0` | `[ERR] ... not writable` | **白名单拦住写 RCC** |
 | `HELP` | 命令表 | — |
@@ -646,7 +679,44 @@ clangd `.cache/`、`__pycache__/`、OS 垃圾文件。
 
 > **每次改动代码后在此追加一条，最新的在最上面。**
 
-### 2026-02-13 — 以太网命令接口 + 板级 IO 注册表（本提交）
+### 2026-02-13 — 分层发送层 + `BROADCAST` / `PING` 命令
+
+**为什么做这个**：OLED 全屏位图一帧 1032 字节（4 字节头 + 1024 字节帧缓冲），
+而原来的 `send_to_peer()` 复用的 `s_tx_buf` 只有 512 字节，**发不出去**；
+再加上 1032 字节大于"网络调试助手"的接收习惯区，需要一条能同时发给两个目标的通道。
+所以先把发送能力分层抽出来，再用命令把它接出来。
+
+**改动 `Core/Src/echo_service.c` / `Core/Inc/echo_service.h`**：
+
+- **新增最底层 `static err_t send_raw(const ip_addr_t *ip, u16_t port, const void *data, u16_t len)`**：
+  不做拷贝、不截断，`len` 上限就是 `u16_t`。用 `MEM_SIZE` 允许的最短路径组包。
+- **新增 `static err_t send_to_addr(const ip_addr_t *ip, u16_t port, const void *data, u16_t len)`**：
+  拷进 `s_tx_buf` 再调 `send_raw()`，`len > ECHO_TX_BUF_SIZE` 时回 `ERR_MEM`。
+- **`send_to_peer()` 保持不变**（挡在 512 字节，复用 `s_tx_buf`）。
+- **新增对外 API**（`.h` 里声明，供 `reg_shell.c` 使用）：
+  - `int Echo_Service_Reply(const char *msg, u16_t len)` —— 文本答复，走 `send_to_peer()`。
+  - `int Echo_Service_ReplyRaw(const void *data, u16_t len)` —— 二进制答复，等价路径。
+  - `int Echo_Service_ReplyBoth(const void *data, u16_t len)` —— **大帧**：同时发
+    `send_to_peer()` 和 `send_raw(s_bcast_ip, s_bcast_port)` 两路。
+  - `int Echo_Service_ReplyChunked(const void *data, u16_t len, u16_t mtu)` —— 按 mtu
+    切片逐片发（当前无人使用，留作"必须完整送达"的备选）。
+  - `int Echo_Service_SetBroadcast(const ip_addr_t *ip, u16_t port)` —— 设第二路目标；
+    `ip == NULL` 且 `port != 0` 表示"就用当前 peer 的 IP"；`port == 0` 表示关闭。
+- 新增 `static ip_addr_t s_bcast_ip;` + `static u16_t s_bcast_port;` 记录第二路目标。
+
+> **为什么大帧不切片**：1472 字节在 100M 链路上只要约 0.1ms，**切片没有收益**。
+> 真正的瓶颈是 I2C（1024 字节 @100kHz ≈ 100ms）。需要的是"分两路回包"，不是"分多次发"。
+
+**改动 `Core/Src/reg_shell.c`**：
+
+- `:10` 加 `#include "echo_service.h"`。
+- 命令表新增 `BROADCAST [port]` 与 `PING`（见 §3.7 命令表）。
+- `BROADCAST` 走 `Echo_Service_SetBroadcast(NULL, port)`，**只改第二路目标，不动 peer**。
+- 帮助文本同步更新。
+
+同步更新 AGENTS.md §3.5 / §3.7 / §5 / §10。
+
+### 2026-02-13 — 以太网命令接口 + 板级 IO 注册表
 
 > **本条写入时代码尚未编译验证**（§0 要求先写文档再 commit）。烧写后请按 §7.5 逐条核对。
 

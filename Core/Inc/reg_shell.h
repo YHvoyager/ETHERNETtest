@@ -25,6 +25,13 @@
   *   WB <addr> <val>     写 8 位
   *   INFO                板子状态（tick、IO 数量）
   *
+  *   OLED                回读屏上内容（4 行 × 16 格的 ASCII 示意）
+  *   OLED SCAN           扫 I2C2 总线，看屏在不在
+  *   OLED CLR / FILL     清屏 / 全亮
+  *   OLED TXT <行> <文本> 在第 0~3 行写字（每行 16 个 ASCII 字符）
+  *   OLED PIX <x> <y> [0|1]  画一个像素
+  *   OLED RAW <hex...>   把原始字节直接发到 I2C 上，**绕开驱动**
+  *
   * 例：
   *   LED0                 → OK IO 0 (DS0) = ON (toggled)      ← 最常用，就敲 4 个字符
   *   LED 0 1              → OK IO 0 (DS0) = ON

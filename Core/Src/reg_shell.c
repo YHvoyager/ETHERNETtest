@@ -7,6 +7,8 @@
 
 #include "reg_shell.h"
 #include "board_io.h"
+#include "ssd1306.h"
+#include "echo_service.h"
 #include "main.h"
 
 #include <stdio.h>
@@ -233,7 +235,15 @@ static const char *const s_help_text =
   "  W <addr> <val>     write 32-bit register, hex\r\n"
   "  RB <addr>          read one byte\r\n"
   "  WB <addr> <val>    write one byte\r\n"
-  "examples: LED0  |  LED 1 1  |  W 40020014 3  |  R 40020014\r\n";
+  "  OLED               show what is currently on the OLED\r\n"
+  "  OLED SCAN          scan I2C2 bus (is the panel alive?)\r\n"
+  "  OLED CLR           clear screen (no argument = re-flush)\r\n"
+  "  OLED TXT <l> <t>   write text on line l (0..3)\r\n"
+  "  OLED RAW <hex>     send hex register bytes, bypassing the driver\r\n"
+  "  OLED PIX <x> <y> [0|1]  draw one pixel\r\n"
+  "  BROADCAST [port]   mirror frames to a 2nd socket (0 = off)\r\n"
+  "  PING               liveness check the PC can use to probe the board\r\n"
+  "examples: LED0  |  LED 1 1  |  W 40020014 3  |  OLED TXT 0 HELLO\r\n";
 
 const char *Reg_Shell_Help(void)
 {
@@ -473,6 +483,294 @@ static int cmd_write(uint32_t addr, uint32_t val, int is_byte,
 }
 
 /* ------------------------------------------------------------------------- */
+/* OLED 命令                                                                   */
+/* ------------------------------------------------------------------------- */
+
+/**
+  * @brief  把整屏内容以文本形式描述出来（4 行 × 16 字符）
+  * @note   面板上的**中文字库方块**和**未知字符**在这里显示成 '.',
+  *         因为它们在图形缓冲里本来就是像素，没有字符可还原。
+  */
+static int cmd_oled_show(char *out, uint32_t out_size)
+{
+  const uint8_t *buf = SSD1306_GetBuffer();
+  uint32_t       used;
+  uint8_t        line;
+  uint8_t        col;
+  int            n;
+
+  n = snprintf(out, (size_t)out_size, "OLED 128x64 (I2C2):\r\n");
+  if (n < 0) { return -1; }
+  used = (uint32_t)n;
+
+  /* 每行 16 个字符 × 8 像素 = 128 列；每行 16 像素高 = 2 页 */
+  for (line = 0U; line < 4U; line++)
+  {
+    uint8_t page = (uint8_t)(line * 2U);
+
+    if (used + 20U >= (uint32_t)out_size) { break; }
+
+    out[used++] = '|';
+
+    for (col = 0U; col < 16U; col++)
+    {
+      /* 直接用图形缓冲判断"这一格有没有点亮的像素"，
+       * 不反查字库 —— 缓冲区里存的是像素，不是字符。 */
+      uint8_t  i;
+      uint8_t  row;
+      uint8_t  any = 0U;
+
+      for (i = 0U; i < 8U; i++)
+      {
+        for (row = 0U; row < 16U; row++)
+        {
+          uint8_t px  = (uint8_t)(col * 8U + i);
+          uint8_t py  = (uint8_t)(line * 16U + row);
+          uint8_t pg  = (uint8_t)(py >> 3);
+          uint8_t bit = (uint8_t)(py & 7U);
+
+          if ((buf[(uint16_t)pg * SSD1306_WIDTH + px] & (uint8_t)(1U << bit)) != 0U)
+          {
+            any = 1U;
+          }
+        }
+      }
+
+      out[used++] = (any != 0U) ? '#' : '.';
+    }
+
+    out[used++] = '|';
+    out[used++] = '\r';
+    out[used++] = '\n';
+  }
+
+  out[used] = '\0';
+  return 1;
+}
+
+/**
+  * @brief  OLED <子命令> 的总入口
+  */
+static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
+{
+  int n;
+
+  /* ---- OLED（无参数）= 把屏上内容读回来 ---- */
+  if (ntok < 2UL)
+  {
+    return cmd_oled_show(out, out_size);
+  }
+
+  /* ---- OLED SCAN ---- */
+  if (strcmp(tok[1], "SCAN") == 0)
+  {
+    uint32_t found = SSD1306_I2CScan(out, out_size);
+    if (found == 0UL)
+    {
+      return -1;
+    }
+    /* 顺带报一下 0x3C 在不在，这是最常问的问题 */
+    if (strstr(out, "0x3C") == NULL)
+    {
+      uint32_t used = (uint32_t)strlen(out);
+      if (used + 48U < out_size)
+      {
+        (void)snprintf(out + used, (size_t)(out_size - used),
+                       "note: 0x3C (SSD1306) NOT found -> wiring/power, not driver\r\n");
+      }
+    }
+    return 1;
+  }
+
+  /* ---- OLED CLR ---- */
+  if (strcmp(tok[1], "CLR") == 0)
+  {
+    SSD1306_Clear(0U);
+    n = SSD1306_Flush();
+    if (n != 0)
+    {
+      (void)snprintf(out, (size_t)out_size,
+                     "ERR: flush failed (%d), I2C err=0x%08lX\r\n",
+                     n, (unsigned long)HAL_I2C_GetError(&hi2c2));
+      return -1;
+    }
+    (void)snprintf(out, (size_t)out_size, "OK OLED cleared\r\n");
+    return 1;
+  }
+
+  /* ---- OLED FILL ---- */
+  if (strcmp(tok[1], "FILL") == 0)
+  {
+    SSD1306_Clear(1U);
+    n = SSD1306_Flush();
+    (void)snprintf(out, (size_t)out_size,
+                   (n == 0) ? "OK OLED filled (all pixels on)\r\n"
+                            : "ERR: flush failed\r\n");
+    return (n == 0) ? 1 : -1;
+  }
+
+  /* ---- OLED PIX <x> <y> [0|1] ---- */
+  if (strcmp(tok[1], "PIX") == 0)
+  {
+    uint32_t x;
+    uint32_t y;
+    uint8_t  on = 1U;
+
+    if (ntok < 4UL)
+    {
+      (void)snprintf(out, (size_t)out_size,
+                     "ERR: usage: OLED PIX <x> <y> [0|1]\r\n");
+      return -1;
+    }
+    if ((parse_dec(tok[2], &x) == 0) || (parse_dec(tok[3], &y) == 0))
+    {
+      (void)snprintf(out, (size_t)out_size, "ERR: x/y must be decimal\r\n");
+      return -1;
+    }
+    if (x >= SSD1306_WIDTH || y >= SSD1306_HEIGHT)
+    {
+      (void)snprintf(out, (size_t)out_size,
+                     "ERR: out of range (x 0..%u, y 0..%u)\r\n",
+                     (unsigned int)(SSD1306_WIDTH - 1U),
+                     (unsigned int)(SSD1306_HEIGHT - 1U));
+      return -1;
+    }
+    if (ntok >= 5UL)
+    {
+      on = (tok[4][0] == '0') ? 0U : 1U;
+    }
+
+    SSD1306_DrawPixel((uint8_t)x, (uint8_t)y, on);
+    n = SSD1306_Flush();
+    (void)snprintf(out, (size_t)out_size,
+                   "OK OLED (%u,%u) = %s\r\n",
+                   (unsigned int)x, (unsigned int)y, (on != 0U) ? "ON" : "OFF");
+    return (n == 0) ? 1 : -1;
+  }
+
+  /* ---- OLED TXT <line> <text...> ----
+   * 文本可以带空格，所以从 tok[3] 起要**拼回去**，不能用单个 token。 */
+  if (strcmp(tok[1], "TXT") == 0)
+  {
+    uint32_t line;
+    uint8_t  y;
+
+    if (ntok < 4UL)
+    {
+      (void)snprintf(out, (size_t)out_size,
+                     "ERR: usage: OLED TXT <line 0..3> <text>\r\n");
+      return -1;
+    }
+    if (parse_dec(tok[2], &line) == 0)
+    {
+      (void)snprintf(out, (size_t)out_size, "ERR: bad line '%s'\r\n", tok[2]);
+      return -1;
+    }
+    if (line > 3UL)
+    {
+      (void)snprintf(out, (size_t)out_size,
+                     "ERR: line must be 0..3 (4 lines of 16 chars)\r\n");
+      return -1;
+    }
+
+    y = (uint8_t)(line * 16U);
+
+    /* 先擦掉这一行（两页），否则新文本比旧文本短时会留下尾巴 */
+    SSD1306_DrawString(0U, y,        "                ", 0U);
+    SSD1306_DrawString(0U, (uint8_t)(y + 8U), "                ", 0U);
+
+    /* 把 tok[3..] 用空格拼回来 */
+    {
+      char    joined[SHELL_MAX_LINE];
+      uint32_t used = 0UL;
+      uint32_t i;
+
+      joined[0] = '\0';
+      for (i = 3UL; i < ntok; i++)
+      {
+        size_t tl = strlen(tok[i]);
+
+        if (used + tl + 2U >= sizeof(joined))
+        {
+          break;
+        }
+        if (i > 3UL)
+        {
+          joined[used++] = ' ';
+        }
+        memcpy(joined + used, tok[i], tl);
+        used += (uint32_t)tl;
+        joined[used] = '\0';
+      }
+
+      SSD1306_DrawString(0U, y, joined, 1U);
+    }
+
+    n = SSD1306_Flush();
+    if (n != 0)
+    {
+      (void)snprintf(out, (size_t)out_size,
+                     "ERR: flush failed (%d), I2C err=0x%08lX\r\n",
+                     n, (unsigned long)HAL_I2C_GetError(&hi2c2));
+      return -1;
+    }
+
+    (void)snprintf(out, (size_t)out_size, "OK OLED line %u updated\r\n",
+                   (unsigned int)line);
+    return 1;
+  }
+
+  /* ---- OLED RAW <hex...> ----
+   * 直接往 I2C2 上发原始字节，**完全绕开驱动**。
+   * 这是留给"以后要让 AI 直接操作 SSD1306 寄存器"的逃生口，
+   * 也是排查"到底是驱动写错了还是屏不认命令"的最后手段。 */
+  if (strcmp(tok[1], "RAW") == 0)
+  {
+    uint8_t  raw[64];
+    uint32_t cnt = 0UL;
+    uint32_t i;
+
+    for (i = 2UL; (i < ntok) && (cnt < sizeof(raw)); i++)
+    {
+      uint32_t v;
+
+      if (parse_hex(tok[i], &v) == 0 || v > 0xFFUL)
+      {
+        (void)snprintf(out, (size_t)out_size,
+                       "ERR: bad hex byte '%s'\r\n", tok[i]);
+        return -1;
+      }
+      raw[cnt++] = (uint8_t)v;
+    }
+
+    if (cnt == 0UL)
+    {
+      (void)snprintf(out, (size_t)out_size,
+                     "ERR: usage: OLED RAW <hex byte> [hex byte ...]\r\n");
+      return -1;
+    }
+
+    if (HAL_I2C_Master_Transmit(&hi2c2, SSD1306_I2C_ADDR, raw,
+                                (uint16_t)cnt, SSD1306_I2C_TIMEOUT) != HAL_OK)
+    {
+      (void)snprintf(out, (size_t)out_size,
+                     "ERR: I2C transmit failed, err=0x%08lX\r\n",
+                     (unsigned long)HAL_I2C_GetError(&hi2c2));
+      return -1;
+    }
+
+    (void)snprintf(out, (size_t)out_size, "OK sent %u byte(s) to 0x%02X\r\n",
+                   (unsigned int)cnt, SSD1306_I2C_ADDR);
+    return 1;
+  }
+
+  (void)snprintf(out, (size_t)out_size,
+                 "ERR: unknown OLED subcommand '%s' (try: SCAN CLR FILL TXT PIX RAW)\r\n",
+                 tok[1]);
+  return -1;
+}
+
+/* ------------------------------------------------------------------------- */
 /* 入口                                                                        */
 /* ------------------------------------------------------------------------- */
 
@@ -627,6 +925,12 @@ int Reg_Shell_Exec(const char *cmd, uint32_t cmd_len,
     }
   }
 
+  /* ---- OLED ---- */
+  if (strcmp(tok[0], "OLED") == 0)
+  {
+    return cmd_oled(ntok, tok, out, out_size);
+  }
+
   /* ---- R / RB ---- */
   if ((strcmp(tok[0], "R") == 0) || (strcmp(tok[0], "RB") == 0))
   {
@@ -673,6 +977,62 @@ int Reg_Shell_Exec(const char *cmd, uint32_t cmd_len,
     }
 
     return cmd_write(addr, val, (tok[0][1] == 'B') ? 1 : 0, out, out_size);
+  }
+
+  /* ---- BROADCAST [port] ----
+   * 让板子把大帧（目前只有 OLED 全屏图）同时发到这个端口。
+   * 目的是让 PC 侧能用两个 socket：一个发命令、一个只收数据流，
+   * 不用在同一个 socket 上区分"这是应答还是帧"。
+   * 不带参数 = 关掉。0 = 关掉。 */
+  if (strcmp(tok[0], "BROADCAST") == 0)
+  {
+    uint32_t port = 0UL;
+
+    if ((ntok >= 2UL) && (parse_dec(tok[1], &port) == 0))
+    {
+      (void)snprintf(out, (size_t)out_size,
+                     "ERR: bad port '%s' (use BROADCAST <port> or BROADCAST 0)\r\n",
+                     tok[1]);
+      return -1;
+    }
+
+    if (port == 0UL)
+    {
+      (void)Echo_Service_SetBroadcast(NULL, 0U);
+      (void)snprintf(out, (size_t)out_size, "OK broadcast off\r\n");
+      return 1;
+    }
+
+    if (port > 65535UL)
+    {
+      (void)snprintf(out, (size_t)out_size, "ERR: port must be 1..65535\r\n");
+      return -1;
+    }
+
+    /* 订阅方就是"最后发命令的那台 PC"（由 echo_service.c 记录），
+     * 所以这里传 NULL，让它自己填 IP。 */
+    if (Echo_Service_SetBroadcast(NULL, (uint16_t)port) != 0)
+    {
+      (void)snprintf(out, (size_t)out_size,
+                     "ERR: no peer yet -- send any packet first\r\n");
+      return -1;
+    }
+
+    (void)snprintf(out, (size_t)out_size,
+                   "OK broadcast to port %u (from the PC that sent this)\r\n",
+                   (unsigned int)port);
+    return 1;
+  }
+
+  /* ---- PING ----
+   * 给"活着吗"这个问题一个最便宜的回答（回 PONG + tick）。
+   * ICMP 的 ping 走协议栈、有 ARP 开销；这个是应用层的，命令发出到
+   * 应答只有一次 UDP 往返，AI 侧可以用它探测板子是否在线。 */
+  if (strcmp(tok[0], "PING") == 0)
+  {
+    (void)snprintf(out, (size_t)out_size, "PONG tick=%lu\r\n",
+                   (unsigned long)HAL_GetTick());
+    return 1;
   }
 
   /* 首关键字不认识 —— 不是命令。交给调用者（中文回声）处理。 */

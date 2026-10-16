@@ -28,6 +28,7 @@
 #include "debug_uart.h"
 #include "eth_phy.h"
 #include "board_io.h"       /* 板级 IO 注册表（DS0/DS1） */
+#include "ssd1306.h"        /* SSD1306 128x64 OLED（I2C2） */
 #include "echo_service.h"   /* 带话术的回声服务（当前启用） */
 #include "udp_echo.h"       /* 原样回环（保留，未启用，端口与上面冲突） */
 /* gnetif 定义在 LWIP/App/lwip.c，但 lwip.h 没有 extern 它，这里自己声明 */
@@ -144,6 +145,32 @@ int main(void)
   if (Echo_Service_Init() != 0)
   {
     printf("[ERR] Echo_Service_Init() failed -- echo service unavailable\r\n");
+  }
+
+  /* SSD1306 OLED（I2C2，和 PCF8574 共用总线）。
+   *
+   * 【为什么放在 ETH_PHY_ReleaseReset() 之后】
+   * 同一根 I2C2 上挂着 PCF8574（管 ETH_RESET）。OLED 插上后总线负载变大，
+   * 如果 OLED 初始化把总线拉死，紧接着的 ETH_PHY_ReleaseReset() 就会失败，
+   * 而那个函数失败是 while(1) 直接停 —— 板子永远起不来。
+   * 放在后面，最坏情况也只是屏不亮，网络照常。
+   *
+   * 【失败不阻塞】屏是可选外设，初始化失败只打印日志，主循环继续跑。 */
+  if (SSD1306_Init() != 0)
+  {
+    printf("[OLED] init failed -- continuing without display "
+           "(try: send 'OLED SCAN' over UDP)\r\n");
+  }
+  else
+  {
+    SSD1306_DrawString(0U,  0U, "ETHERNETtest", 1U);
+    SSD1306_DrawString(0U, 16U, "192.168.1.30", 1U);
+    SSD1306_DrawString(0U, 32U, "UDP :8080", 1U);
+    SSD1306_DrawString(0U, 48U, "type HELP", 1U);
+    if (SSD1306_Flush() != 0)
+    {
+      printf("[OLED] boot screen flush failed\r\n");
+    }
   }
   /* USER CODE END 2b */
 

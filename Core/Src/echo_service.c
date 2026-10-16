@@ -73,6 +73,12 @@ static ip_addr_t s_peer_ip;
 static u16_t     s_peer_port = 0U;
 static uint8_t   s_have_peer = 0U;
 
+/* OLED 大帧回包用的第二目标（见 echo_service.h 的 BROADCAST） */
+static ip_addr_t s_bcast_ip;
+static u16_t     s_bcast_port = 0U;
+static uint8_t   s_bcast_enabled = 0U;
+
+
 /** 心跳节流 */
 static uint32_t  s_last_beat_tick = 0U;
 
@@ -170,6 +176,173 @@ static void sanitize_inplace(char *s, size_t len)
       s[i] = '.';
     }
   }
+}
+
+/**
+  * @brief  最底层发送：不拷贝、不截断，直接把 data 组包发到 ip:port
+  * @retval 0 = 成功，-1 = 失败
+  *
+  * @note   所有对外回包函数最终都汇到这里。len 的上限是 u16_t（65535），
+  *         但实际能发多少取决于 PBUF_POOL 的配置 —— 超了会返回 -1 并打警告。
+  */
+static int send_raw(const void *data, size_t len, const ip_addr_t *ip, u16_t port)
+{
+  struct pbuf *p;
+  err_t err;
+
+  if ((data == NULL) || (ip == NULL) || (len == 0U) || (len > 0xFFFFU))
+  {
+    return -1;
+  }
+
+  p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)len, PBUF_POOL);
+  if (p == NULL)
+  {
+    printf("[ECHO] WARN: pbuf_alloc(%u) failed -- raise PBUF_POOL_SIZE?\r\n",
+           (unsigned int)len);
+    return -1;
+  }
+
+  if (pbuf_take(p, data, (u16_t)len) != ERR_OK)
+  {
+    printf("[ECHO] WARN: pbuf_take failed\r\n");
+    pbuf_free(p);
+    return -1;
+  }
+
+  err = udp_sendto(s_pcb, p, ip, port);
+  pbuf_free(p);   /* 本工程用拷贝语义，交给下层之后这里可以释放 */
+
+  if (err != ERR_OK)
+  {
+    printf("[ECHO] WARN: udp_sendto failed (err=%d)\r\n", (int)err);
+    return -1;
+  }
+
+  return 0;
+}
+
+/**
+  * @brief  把一个数据块发到**任意** ip:port（不依赖"最后来包的 peer"）
+  * @retval 0 = 成功，-1 = 失败
+  *
+  * @note   上限是 ECHO_TX_BUF_SIZE（512），因为中转用的是 static 缓冲；
+  *         要发更大的东西用下面的 send_to_addr()。
+  */
+static int send_to_addr(const ip_addr_t *ip, u16_t port, const void *msg, size_t len)
+{
+  if ((ip == NULL) || (msg == NULL) || (len == 0U))
+  {
+    return -1;
+  }
+
+  if (len > (size_t)ECHO_TX_BUF_SIZE)
+  {
+    return -1;
+  }
+
+  memcpy(s_tx_buf, msg, len);
+  return send_raw(s_tx_buf, len, ip, port);
+}
+
+/**
+  * @brief  把一条消息发给**最后来包的那台 PC**（普通回包路径）
+  *
+  * 命令处理函数用它。这样命令实现本身不需要知道"谁是 peer"。
+  */
+int Echo_Service_Reply(const char *msg, size_t len)
+{
+  if ((msg == NULL) || (len == 0U) || (len > (size_t)ECHO_TX_BUF_SIZE))
+  {
+    return -1;
+  }
+
+  memcpy(s_tx_buf, msg, len);
+  return send_to_peer(s_tx_buf, len);
+}
+
+/**
+  * @brief  回一段**二进制**数据（不是字符串），可用于 TLS 记录层这种大帧
+  *
+  * @note   与 Echo_Service_Reply 的区别只在语义上（这个不做 strlen 假设、
+  *         不要求可打印），实现上和它一样走 send_to_peer。
+  */
+int Echo_Service_ReplyRaw(const void *data, size_t len)
+{
+  if ((data == NULL) || (len == 0U) || (len > (size_t)ECHO_TX_BUF_SIZE))
+  {
+    return -1;
+  }
+
+  memcpy(s_tx_buf, data, len);
+  return send_to_peer(s_tx_buf, len);
+}
+
+/**
+  * @brief  大帧回包：先普通回给最后来包的 PC，再发给 BROADCAST 订阅端口
+  *
+  * 见 echo_service.h 里关于"为什么需要第二路"的说明。两路都是同一个
+  * s_pcb（绑定在 ECHO_SERVICE_PORT 上），但发往**不同的目的端口**，
+  * 所以抓包时能区分"命令应答"和"数据流"。
+  */
+int Echo_Service_ReplyBoth(const void *data, size_t len)
+{
+  int rc = -1;
+
+  if ((data == NULL) || (len == 0U) || (len > (size_t)ECHO_TX_BUF_SIZE))
+  {
+    return -1;
+  }
+
+  if (s_have_peer != 0U)
+  {
+    memcpy(s_tx_buf, data, len);
+    rc = send_to_peer(s_tx_buf, len);
+  }
+
+  if (s_bcast_enabled != 0U)
+  {
+    (void)send_raw(data, len, &s_bcast_ip, s_bcast_port);
+  }
+
+  return rc;
+}
+
+/**
+  * @brief  拆成不超过 mtu 的分片，逐片回给最后来包的 PC
+  *
+  * 给"必须完整送达"的场景用（例如 TLS 握手记录）：
+  * 真发丢一片就整条链路失败，比慢一点更糟。
+  * ⚠ 只在必要时用 —— 每片一次 udp_sendto，片间没有流量控制，
+  *   发太快会把驱动队列填满（返回 ERR_MEM）。
+  */
+int Echo_Service_ReplyChunked(const uint8_t *data, size_t len, uint16_t mtu)
+{
+  size_t off = 0UL;
+  size_t chunk;
+
+  if ((data == NULL) || (len == 0U) || (mtu < 64U))
+  {
+    return -1;
+  }
+
+  while (off < len)
+  {
+    chunk = len - off;
+    if (chunk > (size_t)mtu)
+    {
+      chunk = (size_t)mtu;
+    }
+
+    if (send_raw(&data[off], chunk, &s_peer_ip, s_peer_port) != 0)
+    {
+      return -1;
+    }
+
+    off += chunk;
+  }
+
+  return 0;
 }
 
 /**
@@ -406,6 +579,40 @@ int Echo_Service_Init(void)
   printf("[ECHO] send anything, board replies: \"...\" is what I got\r\n");
   printf("[ECHO] or send a command: LED0 / LED 1 1 / IO / R 40020014 / W 40020014 3 / HELP\r\n");
 
+  return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* 对外接口                                                                    */
+/* ------------------------------------------------------------------------- */
+
+int Echo_Service_SetBroadcast(const ip_addr_t *ip, uint16_t port)
+{
+  if ((ip == NULL) || (port == 0U))
+  {
+    /* ip == NULL 有两种用法：port == 0 → 关闭；
+     *                         port != 0 → 用"最后来包的那台 PC"当订阅方 */
+    if (port == 0U)
+    {
+      s_bcast_enabled = 0U;
+      s_bcast_port    = 0U;
+      return 0;
+    }
+
+    if (s_have_peer == 0U)
+    {
+      return -1;                 /* 还没人给我发过包，不知道订阅方是谁 */
+    }
+
+    ip_addr_copy(s_bcast_ip, s_peer_ip);
+    s_bcast_port    = port;
+    s_bcast_enabled = 1U;
+    return 0;
+  }
+
+  ip_addr_copy(s_bcast_ip, *ip);
+  s_bcast_port    = port;
+  s_bcast_enabled = 1U;
   return 0;
 }
 

@@ -128,6 +128,35 @@ SYSTEM_PROMPT = """你是一个为 128x64 单色 OLED 屏幕写动画的工程�
 
     math 可直接用 sin/cos/sqrt/pi，random 可用 randint/uniform。
 
+## 中文文字（重要）
+
+**显示中文必须用 draw_text()，不能用 c.text()。** c.text() 只有 ASCII 字库，
+传中文会画出一堆问号或空白。
+
+    draw_text(c, x, y, "你好")                     在 (x,y) 写中文，16x16 点阵
+    draw_text(c, x, y, "温度 25", center=True)     可选水平居中（x 当作中心）
+    draw_text(c, x, y, "你好", size=24)            可选字号（默认 16）
+
+规则：
+- **每个汉字占 16x16 像素**。128 宽一屏最多 8 个字，别写长句子。
+- x 是左边缘（center=True 时是水平中心），y 是上边缘。
+- 中英混排可以：「温度 25」这样一个字格里都能放下。
+- 不要用 c.blit() 手动贴字 —— 计算点阵是 draw_text() 内部的事。
+- **不要把 draw_text 当变量名**（它是函数），也别把 text 当变量名。
+- 想让字更醒目：先用 c.fill_rect() 铺底，或者把字放大到 size=24/32。
+
+## 例子 3：中文 + 动画
+
+def draw(c, t, p):
+    # 闪烁的提示文字，每 0.5 秒一次
+    if (t % 1.0) < 0.5:
+        draw_text(c, 64, 8, "正在充电", center=True)
+    # 下面画一个跳动的电池格
+    for i in range(4):
+        c.rect(24 + i * 20, 36, 16, 14, True)
+    level = int(t * 2) % 4 + 1
+    c.fill_rect(24, 36, level * 20, 14, True)
+
 ## 例子 1：一只眨眼的眼睛
 
 def draw(c, t, p):
@@ -186,6 +215,34 @@ def _llm_config() -> Dict[str, str]:
     return {"key": key, "base": base.rstrip("/"), "model": model}
 
 
+def _chat_url(base: str) -> str:
+    """
+    把 base_url 拼成完整的 chat/completions 地址。
+
+    【为什么不能简单 base + "/v1/chat/completions"】
+
+    不同厂商给出的 base_url 习惯不一样：
+
+        DeepSeek    https://api.deepseek.com                  -> 要补 /v1/chat/completions
+        OpenAI      https://api.openai.com                    -> 要补 /v1/chat/completions
+        通义千问    https://dashscope.aliyuncs.com/compatible-mode/v1
+                                                              -> 已经带 /v1，再补就 404
+        智谱 GLM    https://open.bigmodel.cn/api/paas/v4       -> 版本号是 v4，不是 v1
+        本地 Ollama http://localhost:11434/v1                  -> 带 /v1，且没有版本前缀
+
+    所以规则是：**base 已经以 /v1（或 v2/v3/v4）结尾，就直接接
+    /chat/completions；否则才补 /v1**。这样上面五种都能work，
+    用户只填 base_url，不用记这个约定。
+    """
+    import re
+
+    b = base.rstrip("/")
+    # 已经是 .../v1 或 .../v4 这类版本路径结尾，不再补
+    if re.search(r"/v\d+$", b):
+        return b + "/chat/completions"
+    return b + "/v1/chat/completions"
+
+
 def ask_llm_for_code(description: str, timeout: float = 60.0) -> str:
     """
     把用户的描述发给 LLM，拿回一段 draw() 代码。
@@ -197,7 +254,7 @@ def ask_llm_for_code(description: str, timeout: float = 60.0) -> str:
     import urllib.request
 
     cfg = _llm_config()
-    url = cfg["base"] + "/v1/chat/completions"
+    url = _chat_url(cfg["base"])
     body = {
         "model": cfg["model"],
         "messages": [
@@ -324,6 +381,27 @@ def code_for(description: str, use_cache: bool = True,
 # 播放循环
 # ---------------------------------------------------------------------------
 
+def _render_once(renderer, t: float, params: Dict) -> bytes:
+    """渲染一帧，兼容两种调用者。
+
+    play() 有两个入口，传进来的东西形状不一样：
+
+    * 路径 A（内置动画 / --code 文件）：传的是**裸函数** fn(t, params) -> bytes
+    * 路径 B（LLM 写的代码）：传的是 **Renderer 对象**，它自己管超时
+
+    早先 play() 里写死了 renderer.render(t, params)，于是 --anim 一跑到第一帧
+    就 `AttributeError: 'function' object has no attribute 'render'`。
+    这个 bug 一直没暴露，是因为在此之前板子从来没有成功回过包 ——
+    play() 根本没机会执行到渲染那一步。
+
+    所以这里按"有没有 .render 方法"分派，两条路都走通。
+    """
+    fn = getattr(renderer, "render", None)
+    if callable(fn):
+        return fn(t, params)
+    return renderer(t, params)
+
+
 def play(renderer, board: Optional[Board], fps: float, seconds: float,
          params: Dict, seq: bool = True, stats_every: float = 0.0) -> None:
     """
@@ -363,7 +441,7 @@ def play(renderer, board: Optional[Board], fps: float, seconds: float,
 
             t = frame_no / fps
             try:
-                frame = renderer.render(t, params)
+                frame = _render_once(renderer, t, params)
             except SandboxError as e:
                 print("\n[agent] 渲染第 %d 帧失败：%s" % (frame_no, e))
                 break
@@ -526,6 +604,44 @@ def _save_png(frame: bytes, path: str) -> None:
         f.write(png)
 
 
+# 常见厂商的兼容端点，--envcheck 里列出来给用户抄
+_KNOWN_ENDPOINTS = {
+    "deepseek": ("https://api.deepseek.com", "deepseek-chat"),
+    "openai":   ("https://api.openai.com", "gpt-4o-mini"),
+    "qwen":     ("https://dashscope.aliyuncs.com/compatible-mode/v1",
+                 "qwen-plus"),
+    "zhipu":    ("https://open.bigmodel.cn/api/paas/v4", "glm-4-flash"),
+    "ollama":   ("http://localhost:11434/v1", "qwen2.5:7b"),
+}
+
+
+def _cmd_envcheck() -> int:
+    """只检查 LLM 环境是否就绪，不发任何网络请求到板子。"""
+    for name in ("OLED_AGENT_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+        v = os.environ.get(name, "")
+        print("  %-20s %s" % (name, ("已设置 (" + v[:6] + "..." + ")")
+                              if v else "未设置"))
+    base = os.environ.get("OLED_AGENT_BASE_URL", "https://api.deepseek.com")
+    model = os.environ.get("OLED_AGENT_MODEL", "deepseek-chat")
+    print("  %-20s %s" % ("base_url", base))
+    print("  %-20s %s" % ("model", model))
+    print("  %-20s %s" % ("最终请求地址", _chat_url(base)))
+
+    # 常见的国产兼容端点，方便对照着填
+    print("\n换厂商的话，设这两个环境变量就行：")
+    for name, (b, m) in _KNOWN_ENDPOINTS.items():
+        print("  %-10s base=%s" % (name, b))
+        print("  %-10s model=%s" % ("", m))
+
+    try:
+        _llm_config()
+        print("\n[agent] API key 就绪，可以让 LLM 写代码了。")
+        return 0
+    except LLMError as e:
+        print("\n[agent] %s" % e)
+        return 1
+
+
 def _cmd_sandbox_test() -> int:
     """只跑沙箱自检，不联网、不碰 LLM、不需要 API key。"""
     ok, total = self_test()
@@ -617,6 +733,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="只渲染一帧，不播放（配 -t / -o）")
     ap.add_argument("--test", action="store_true",
                     help="只跑沙箱自检")
+    ap.add_argument("--envcheck", action="store_true",
+                    help="检查 LLM 环境变量/API key 是否配好")
 
     ap.add_argument("--fps", type=float, default=20.0,
                     help="发送帧率（默认 20）")
@@ -649,6 +767,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_render(args)
     if args.test:
         return _cmd_sandbox_test()
+    if args.envcheck:
+        return _cmd_envcheck()
 
     return _cmd_play(args)
 

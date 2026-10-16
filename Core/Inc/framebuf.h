@@ -33,6 +33,11 @@
   *   闪回上一帧（看着像卡顿/抖动）；有序号就能直接丢掉迟到的帧，
   *   代价只是少显示一帧，而不是画面倒退。
   *
+  *   ⚠ 判重只拦"差几帧"的迟到包（FB_SEQ_WINDOW = 128 以内），
+  *   序号大幅回退（PC 重跑 agent.py，从 0 重新开始）会被认成新会话并
+  *   重建基线。早期写成"必须严格递增"时，PC 每重跑一次，前 N 帧就被
+  *   全部拒收，屏幕一直不动（实测 good 恒定、ooo 暴涨）。
+  *
   *   两条命令都是**只认二进制**：FB 后面跟的是裸字节，不是文本。它们必须在
   *   文本命令分发（Reg_Shell_Exec）**之前**被识别，见 fb_dispatch() 的说明。
   *
@@ -54,9 +59,16 @@ extern "C" {
 /** 一帧的字节数：128 x 64 / 8 */
 #define FB_BYTES            (1024U)
 
-/** 带序号时的报文总长：5 字节头 "FBSEQ" + 1 空格 + 2 字节序号 + 1024 数据 */
-#define FB_SEQ_HEADER_BYTES (8U)
+/** 带序号时的报文总长：6 字节魔数 "FBSEQ " + 2 字节序号 + 1024 数据 */
+#define FB_SEQ_MAGIC        "FBSEQ "
+#define FB_SEQ_MAGIC_BYTES  (6U)   /* 只比魔数这 6 个字节 */
+#define FB_SEQ_HEADER_BYTES (8U)   /* 魔数 + 序号，共 8 字节 */
 #define FB_SEQ_PACKET_BYTES (FB_SEQ_HEADER_BYTES + FB_BYTES)   /* 1032 */
+
+/* ⚠ 校验魔数时必须用 FB_SEQ_MAGIC_BYTES（6），不能用 FB_SEQ_HEADER_BYTES（8）。
+ * 头一共 8 字节 = 6 字节魔数 + 2 字节序号，拿 8 去 memcmp 会把序号也比进去，
+ * 只有 seq 的低字节恰好为 0（即第一帧）时才碰巧通过 —— 曾因此出现
+ * "good=1 bad=21" 的症状（120 帧里只有第 0 帧被认下）。 */
 
 /**
   * @brief  尝试把一包数据当成二进制帧处理

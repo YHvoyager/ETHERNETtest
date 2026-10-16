@@ -109,7 +109,51 @@ def _make_globals() -> Dict[str, Any]:
         g[fn] = getattr(math, fn)
     g["randint"] = random.randint
     g["uniform"] = random.uniform
+
+    # 【中文支持】把"写字"做成一个绑好的函数摆到顶层，而不是放行
+    # `import bitmap`。两个理由：
+    #   1. 放行 import 会把 gdi32 那套 ctypes 调用暴露进沙箱，攻击面白涨；
+    #   2. bitmap 模块内部会做 GDI 调用并持有全局缓存，在沙箱的子线程里
+    #      反复进 GDI 并不安全（GDI 句柄有进程级上限）。
+    # 这里只暴露一个纯函数 draw_text()，它内部渲染 + 贴到画布，模型不用
+    # 知道点阵是怎么来的。
+    #
+    # ⚠ 名字为什么叫 draw_text 而不是 text：
+    #   已有缓存代码里 LLM 写过 `text = "NI HAO"` 这种局部变量（它把 text
+    #   当普通名词用）。如果我们注入的全局函数也叫 text，就会被局部变量
+    #   遮蔽，模型写 `text(c, ...)` 会撞上 'str' object is not callable。
+    #   draw_text 动词开头，模型不会拿它当变量名。
+    #
+    # 用法（模型会被告知）：
+    #     draw_text(c, 20, 20, "你好")               # 左对齐
+    #     draw_text(c, 20, 20, "你好", center=True)  # 水平居中
+    g["draw_text"] = _make_text_helper()
     return g
+
+
+def _make_text_helper():
+    """
+    造一个 draw_text(c, x, y, s, ...) 辅助函数，内部用 bitmap.py 的 GDI 渲染。
+
+    为什么在函数内部 import bitmap：
+      bitmap.py 在 import 时就会 WinDLL("gdi32")。如果放在模块顶层，
+      非 Windows 平台 import sandbox 就直接炸了。放到函数体里，
+      真正做到"只有要用中文时才碰 GDI"，也让 --envcheck 之类的
+      诊断路径在缺 GDI 时仍能列出其它原因。
+    """
+    def text(c, x, y, s, on=True, center=False, face=None, size=16):
+        import bitmap as _bmp  # 延迟 import：见上面的说明
+
+        s = str(s)
+        if not s:
+            return
+        w, h, bits = _bmp.render_text(s, face or _bmp.DEFAULT_FACE, size)
+        if center:
+            x = int(x - w // 2)
+        # text_bitmap 就是 blit 的别名，签名 (x, y, glyph, w, h, on)
+        c.text_bitmap(int(x), int(y), bits, w, h, on)
+
+    return text
 
 
 def compile_draw(code: str, func_name: str = "draw") -> Callable:
@@ -170,7 +214,7 @@ class Renderer:
     """
 
     def __init__(self, code: str, func_name: str = "draw",
-                 timeout: float = 1.0) -> None:
+                 timeout: float = 3.0) -> None:
         self.code = code
         self.func_name = func_name
         self.timeout = timeout
@@ -183,7 +227,14 @@ class Renderer:
 
         超时用子线程实现。⚠ 超时后那个线程还在跑（Python 杀不掉），
         所以超时值不要设得太小，否则卡住的线程会越积越多。
-        1 秒对 128x64 来说已经极其宽松（正常在 1 毫秒以内）。
+
+        默认 3 秒 —— 为什么不是 1 秒：
+        128x64 的纯画线代码正常在 1 毫秒内跑完，1 秒看似极宽松。但实测
+        遇到过"第 1 帧就超时"的假阳性（同一段代码、同一台机器，重跑就过），
+        怀疑是首次 import / GDI 初始化 / 杀毒扫描之类的一次性抖动。
+        这种抖动本身无害，但它会让整个播放提前 break 退出，用户看到
+        的是"动画完全没出来"，比多等 2 秒糟得多。
+        真死循环的代码在 3 秒里也早该被发现了。
         """
         c = Canvas()
         box: Dict[str, Any] = {}
@@ -200,9 +251,23 @@ class Renderer:
         th.join(self.timeout)
 
         if th.is_alive():
+            # 超时时打一份全线程栈，方便定位卡在哪一行。
+            # ⚠ 曾经用过 threading.settrace() 逐行记录位置，后来撤掉了：
+            # settrace 的回调本身要跟着被测代码逐行走，被测代码一旦死循环，
+            # 回调也跟着无限跑，反而拖慢超时判定、还让 self_test 里那些
+            # "故意死循环"的用例表现异常（自检从 20/20 掉到 10/20）。
+            # 诊断脚手架不该改变被测系统的行为 —— faulthandler 只在超时
+            # 这一刻打一次栈，不参与正常路径，没有这个问题。
+            import faulthandler
+            import sys
+            try:
+                faulthandler.dump_traceback(file=sys.stderr)
+            except Exception:
+                pass
             raise SandboxError(
                 "渲染超时（>%.1f 秒）。检查代码里有没有死循环，"
-                "或者过大的 range()。" % self.timeout
+                "或者过大的 range()。上面是超时那一刻的线程栈。"
+                % self.timeout
             )
         if "err" in box:
             raise SandboxError("渲染时出错：%s" % box["err"])

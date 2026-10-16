@@ -39,6 +39,7 @@ from typing import Callable, Dict, List, Tuple
 
 from canvas import Canvas, HEIGHT, WIDTH
 
+
 # 一个动画就是这么一个函数
 DrawFn = Callable[[Canvas, float, Dict], None]
 
@@ -75,6 +76,38 @@ def _eye(c: Canvas, cx: int, cy: int, r: int, look_x: float, look_y: float,
     # 高光：一点反而让眼睛活了
     if r >= 8:
         c.set(px - pr // 2, py - pr // 2, False)
+
+
+def eyes_fast(c: Canvas, t: float, p: Dict) -> None:
+    """
+    一双**明显在动**的眼睛 —— 专门用来验证"以太网实时改画面"。
+
+    和 eyes() 的区别：瞳孔以 1 秒为周期走到左右极限（±0.95），
+    幅度拉满、周期缩短到 1 秒。这样即使板子只刷到 10fps，
+    每两次刷新之间瞳孔也会移动一大段，肉眼绝对看得出在动。
+
+    参数：
+        period      瞳孔来回一次多少秒，默认 1.0
+        look_speed  保留兼容，未使用
+    """
+    period = float(p.get("period", 1.0))
+
+    # 方波式摆动：前半周期冲向左，后半周期冲向右，两端各停一小会
+    phase = (t / period) % 1.0
+    if phase < 0.45:
+        lx = -0.95
+    elif phase < 0.5:
+        lx = -0.95 + (phase - 0.45) / 0.05 * 1.9
+    elif phase < 0.95:
+        lx = 0.95
+    else:
+        lx = 0.95 - (phase - 0.5 - 0.45) / 0.05 * 1.9
+
+    ly = 0.45 * math.sin(t * 2.0 * math.pi / (period * 2.0))
+
+    r = 18
+    _eye(c, 34, 30, r, lx, ly, 0.0)
+    _eye(c, 94, 30, r, lx, ly, 0.0)
 
 
 def eyes(c: Canvas, t: float, p: Dict) -> None:
@@ -283,12 +316,137 @@ def scrolling_text(c: Canvas, t: float, p: Dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 示例 5：行驶的汽车 —— 用户点名的需求
+#
+# 这是「参照答案」：以后 LLM 现写的汽车可以跟它对比。
+# 结构上刻意分成"车身 / 车窗 / 轮子 / 地面"四块，方便按需改动。
+# 两个轮子各有自己的辐条角度，这样看起来是真在转，而不是两个死圆。
+# ---------------------------------------------------------------------------
+
+def _wheel(c: Canvas, cx: int, cy: int, r: int, angle: float) -> None:
+    """一个轮子：外圈 + 轮毂 + 4 根辐条。angle 是辐条旋转角（弧度）。"""
+    c.circle(cx, cy, r, True, False)          # 外胎（空心圆）
+    c.circle(cx, cy, max(1, r // 3), True, False)   # 轮毂
+    for k in range(4):
+        a = angle + k * (math.pi / 2.0)
+        x1 = int(cx + math.cos(a) * (r - 2))
+        y1 = int(cy + math.sin(a) * (r - 2))
+        c.line(cx, cy, x1, y1, True)
+
+
+def car(c: Canvas, t: float, p: Dict) -> None:
+    """
+    一辆在路上行驶的汽车（侧面剪影，向左开）。
+
+    参数（都可选）：
+        speed   行驶速度，默认 40 像素/秒
+        wheel   轮子半径，默认 6
+        地面高度固定在第 54 行（轮胎底部刚好压住地面线）
+
+    构图（128x64 里）：
+        车身   y 42..54
+        车顶   y 34..42（带一点弧度，用矩形 + 斜线凑）
+        轮子   圆心 y=54，r=6，所以轮胎底在 y=60
+        地面   两条横线，做出路面感
+    """
+    speed = float(p.get("speed", 40.0))
+    r = int(p.get("wheel", 6))
+
+    # 车身位置：从左往右开出去再绕回来（用取模，无缝循环）
+    span = WIDTH + 80      # 128 + 车身宽度余量
+    cy_top = int(48 + 4 * math.sin(t * 3.0))   # 轻微颠簸
+    front = int((WIDTH + 20) - (t * speed) % span)  # 车头 x 坐标，随时间左移
+
+    body_x = front - 70     # 车身左上角
+    body_y = cy_top - 14
+    body_w = 70
+    body_h = 14
+
+    # --- 地面：固定的两条线，给"在行驶"提供参照物 ---
+    c.hline(0, 61, 128, True)
+    for i in range(0, 128, 16):
+        # 路面虚线随车移动（滚动），这样静止画面也能看出"在动"
+        dx = int((-t * speed) % 16)
+        c.hline(i + dx, 56, 6, True)
+
+    # --- 车身 ---
+    c.fill_rect(body_x, body_y, body_w, body_h, True)
+
+    # --- 车顶（比车身窄，靠后一些）---
+    roof_w = 36
+    roof_x = body_x + 16
+    roof_y = body_y - 8
+    c.fill_rect(roof_x, roof_y, roof_w, 8, True)
+    # 斜切前后两块，做出流线感
+    c.line(roof_x, roof_y + 8, roof_x - 6, body_y, False)
+    c.line(roof_x + roof_w, roof_y + 8, roof_x + roof_w + 6, body_y, False)
+
+    # --- 车窗（挖空）---
+    c.fill_rect(roof_x + 4, roof_y + 2, 12, 5, False)
+    c.fill_rect(roof_x + 20, roof_y + 2, 12, 5, False)
+
+    # --- 车灯 ---
+    c.fill_rect(body_x - 2, body_y + 3, 3, 4, True)     # 前灯
+    c.fill_rect(body_x + body_w - 1, body_y + 3, 2, 4, True)  # 尾灯
+
+    # --- 两个轮子 ---
+    # 轮子转的角速度 = 车速 / 半径（纯滚动条件），看起来才不打滑
+    spin = -(t * speed) / max(1, r)
+    w1x = body_x + 14
+    w2x = body_x + body_w - 16
+    for wx in (w1x, w2x):
+        c.circle(wx, body_y + body_h + r - 2, r, False, False)  # 先擦出轮廓
+        _wheel(c, wx, body_y + body_h + r - 2, r, spin)
+
+
+# ---------------------------------------------------------------------------
+# 示例 6：烟花 —— LLM 不好写的东西，用来看粒子和随机
+# ---------------------------------------------------------------------------
+
+def fireworks(c: Canvas, t: float, p: Dict) -> None:
+    """
+    烟花：多次爆炸，每次炸出一圈粒子。
+
+    刻意用 random.seed(固定值) 保证纯函数 —— 同一个 t 永远画同一帧，
+    否则"PC 渲染的帧"和"你单独 render 出来检查的帧"会不一样，
+    调试会疯掉。
+    """
+    random.seed(20241016)
+    period = 1.6
+    burst = int(t / period)
+
+    for b in range(2):                      # 同时最多两朵，避免太乱
+        n = burst - b
+        if n < 0:
+            continue
+        age = (t - n * period) / period     # 0..1
+        if not (0.0 <= age <= 1.0):
+            continue
+        # 爆炸位置的伪随机漂移（用 n 当种子，保证可复现）
+        random.seed(999 + n)
+        cx = 30 + random.randint(0, 68)
+        cy = 14 + random.randint(0, 16)
+        radius = 2 + age * 24
+        for k in range(24):
+            a = k * (2.0 * math.pi / 24.0) + n
+            # 重力：粒子越往后越往下垂
+            px = int(cx + math.cos(a) * radius)
+            py = int(cy + math.sin(a) * radius + age * age * 16)
+            c.set(px, py, True)
+        if age < 0.25:                       # 中心还有余亮
+            c.circle(cx, cy, max(1, int(4 * (1 - age * 4))), True, False)
+
+
+# ---------------------------------------------------------------------------
 # 注册表
 # ---------------------------------------------------------------------------
 
 ANIMS: Dict[str, DrawFn] = {
     "eyes": eyes,
+    "eyes_fast": eyes_fast,
     "horse": horse,
+    "car": car,
+    "fireworks": fireworks,
     "rain": rain,
     "boing": boing,
     "text": scrolling_text,

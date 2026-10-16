@@ -18,6 +18,7 @@
 
 #include "eth_phy.h"
 #include "i2c.h"
+#include "lwip/netif.h"     /* ETH_PHY_CheckLink() 要调 netif_set_link_up/down() */
 #include <stdio.h>
 
 /* ===========================================================================
@@ -179,6 +180,90 @@ void ETH_PHY_Prepare(void)
 #if ETH_PHY_DIAG
   eth_phy_dump_impl();
 #endif
+}
+
+/* ---------------------------------------------------------------------------
+ * 链路检测
+ *
+ * 【这个函数为什么住在 eth_phy.c 而不是 ethernetif.c】
+ * CubeMX 生成的 ethernetif.c 里有个空的 ethernet_link_check_state()，它的
+ * 函数体不在 USER CODE 区内，每次 CubeMX 重新生成都会被清空 —— 已经丢过
+ * 两次，最近一次导致板子"能收不能发"（见下面 ERR_RTE 的说明）。
+ *
+ * 把实现放在本文件，CubeMX 不生成这里、永不覆盖；ethernetif.c 里只留一行
+ * ETH_PHY_CheckLink(netif); —— 就算再被清掉，丢的也只是一行，git diff 一眼
+ * 能看出来。
+ *
+ * 【丢了会怎样 —— 值得完整记一遍】
+ * netif_set_link_up() 永远不会被调用 → netif 的 NETIF_FLAG_LINK_UP 恒为 0
+ * （netif_init() 里 netif->flags = 0，见 lwip/src/core/netif.c:328）
+ * → ip4_route() 的判据 netif_is_up() && netif_is_link_up() && IP非零
+ * 三条里第二条不成立，找不到出口网卡并返回 NULL
+ * → udp_sendto() 一律返回 ERR_RTE(-4)
+ * → 现象是"能收不能发"：PC 发来的命令能到达、能执行（ethernetif_input()
+ * 不看链接标志），但所有回包和每秒心跳全部发不出去。
+ * ------------------------------------------------------------------------- */
+
+/* 只在链路状态变化时打印，避免每 100ms 刷一行。初值 0xFF 表示"还没有过状态"，
+ * 保证开机第一次一定会打印。 */
+#define ETH_PHY_LINK_UNKNOWN 0xFFU
+
+void ETH_PHY_CheckLink(struct netif *netif)
+{
+  static uint8_t s_last_link = ETH_PHY_LINK_UNKNOWN;
+
+  uint32_t bsr = 0;
+  uint32_t bcr = 0;
+  uint8_t  link;
+
+  if (netif == NULL)
+  {
+    return;
+  }
+
+  /* BSR（reg 0x01）必须连读两次取第二次。
+   * IEEE 802.3 规定 bit2 Link Status 和 bit5 Auto-Negotiation Complete 是
+   * **锁存低**（latching low）：链路曾经断过就一直读 0，直到被读走一次才刷新。
+   * 只读一次会拿到"历史值"而不是当前值。 */
+  if (HAL_ETH_ReadPHYRegister(&heth, 0U, 0x01U, &bsr) != HAL_OK)
+  {
+    return;                                 /* 读失败就保持原状态，不乱改 */
+  }
+
+  if (HAL_ETH_ReadPHYRegister(&heth, 0U, 0x01U, &bsr) != HAL_OK)
+  {
+    return;
+  }
+
+  link = ((bsr & 0x0004U) != 0U) ? 1U : 0U;  /* bit2 = Link Status */
+
+  if (link == s_last_link)
+  {
+    return;                                  /* 无变化，不打印也不动 netif */
+  }
+
+  s_last_link = link;
+
+  if (link != 0U)
+  {
+    netif_set_link_up(netif);
+    printf("[LINK] UP  BSR=0x%04lX autoneg_done=%lu (cap: 100FD=%lu 100HD=%lu 10FD=%lu 10HD=%lu)\r\n",
+           (unsigned long)bsr,
+           (unsigned long)((bsr >> 5) & 1U),
+           (unsigned long)((bsr >> 14) & 1U),
+           (unsigned long)((bsr >> 13) & 1U),
+           (unsigned long)((bsr >> 12) & 1U),
+           (unsigned long)((bsr >> 11) & 1U));
+  }
+  else
+  {
+    netif_set_link_down(netif);
+
+    /* 顺手读一次 BCR 一起打印，方便判断"是协商没开还是线没插" */
+    (void)HAL_ETH_ReadPHYRegister(&heth, 0U, 0x00U, &bcr);
+    printf("[LINK] DOWN  BSR=0x%04lX BCR=0x%04lX\r\n",
+           (unsigned long)bsr, (unsigned long)bcr);
+  }
 }
 
 #if ETH_PHY_DIAG

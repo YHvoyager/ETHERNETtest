@@ -499,7 +499,18 @@ int32_t user_phy_get_tick(void)
   */
 void ethernet_link_check_state(struct netif *netif)
 {
-
+  /* ⚠⚠⚠ CubeMX 每次重新生成都会把这个函数体清空（它生成的是空壳，而函数体
+   * 不在 USER CODE 区内）。这里的调用已经丢过两次！
+   *
+   * 丢了之后的症状：能收不能发 —— PC 发来的命令能到达并执行，但板子的回包
+   * 和每秒心跳全是 [ECHO] WARN: udp_sendto failed (err=-4)（ERR_RTE）。
+   * 原因：netif_set_link_up() 永远不被调用 -> NETIF_FLAG_LINK_UP 恒为 0
+   * -> ip4_route() 找不到出口网卡。
+   *
+   * 真正的实现放在 Core/Src/eth_phy.c 的 ETH_PHY_CheckLink() 里（CubeMX 不
+   * 生成那个文件，永不覆盖）。所以重新生成后如果网口又变成"能收不能发"，
+   * 先来这里看一眼这一行还在不在。 */
+  ETH_PHY_CheckLink(netif);
 }
 
 void HAL_ETH_RxAllocateCallback(uint8_t **buff)

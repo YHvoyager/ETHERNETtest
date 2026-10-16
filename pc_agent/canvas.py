@@ -35,6 +35,24 @@ PAGES = HEIGHT // 8          # 8
 FRAME_BYTES = WIDTH * PAGES  # 1024
 
 
+def _iv(v) -> int:
+    """
+    把坐标系数转成 int。所有绘图原语都必须先过这一道。
+
+    为什么必须做：line() 是 Bresenham，终止判据是 `x0 == x1 and y0 == y1`
+    的**精确相等**。传入 float（LLM 生成 `int(x) - 3 + swing` 这种表达式
+    时太常见了，swing 是 float）会导致整数步进的 x0 永远等不到小数 x1，
+    于是 while True 永不退出 —— 表现为"渲染第 1 帧就超时"，与 t 无关。
+
+    另外 int() 是截断不是四舍五入（-0.7 → 0），但坐标差 1 像素看不出来，
+    换来的是"任何数字进来都不会死循环"。
+    """
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0        # 传了 None/字符串这类东西时按 0 处理，不崩
+
+
 class Canvas:
     """一块 128x64 的单色画布。所有绘制原语都是"就地改内存"。"""
 
@@ -77,14 +95,18 @@ class Canvas:
 
     # ---------------------------------------------------------------- 图形
 
-    def hline(self, x: int, y: int, w: int, on: bool = True) -> "Canvas":
+    def hline(self, x, y, w, on: bool = True) -> "Canvas":
+        # 坐标一律 int() 强转 —— 见 _iv() 的说明（float 坐标会让
+        # Bresenham 的 == 判据永不成立，从而死循环）。
+        x, y, w = _iv(x), _iv(y), _iv(w)
         if w < 0:
             x, w = x + w, -w
         for i in range(w):
             self.set(x + i, y, on)
         return self
 
-    def vline(self, x: int, y: int, h: int, on: bool = True) -> "Canvas":
+    def vline(self, x, y, h, on: bool = True) -> "Canvas":
+        x, y, h = _iv(x), _iv(y), _iv(h)
         if h < 0:
             y, h = y + h, -h
         for i in range(h):
@@ -93,6 +115,7 @@ class Canvas:
 
     def rect(self, x, y, w, h, on: bool = True) -> "Canvas":
         """空心矩形。"""
+        x, y, w, h = _iv(x), _iv(y), _iv(w), _iv(h)
         self.hline(x, y, w, on)
         self.hline(x, y + h - 1, w, on)
         self.vline(x, y, h, on)
@@ -101,6 +124,7 @@ class Canvas:
 
     def fill_rect(self, x, y, w, h, on: bool = True) -> "Canvas":
         """实心矩形。"""
+        x, y, w, h = _iv(x), _iv(y), _iv(w), _iv(h)
         if w < 0:
             x, w = x + w, -w
         if h < 0:
@@ -110,7 +134,19 @@ class Canvas:
         return self
 
     def line(self, x0, y0, x1, y1, on: bool = True) -> "Canvas":
-        """Bresenham 直线。"""
+        """
+        Bresenham 直线。
+
+        ⚠ 坐标必须转成 int。旧版直接拿参数走 Bresenham，而终止判据是
+        `x0 == x1 and y0 == y1` 的**精确相等**。一旦传入 float（LLM 常写
+        `c.line(int(x), y, int(x) - 3 + swing, y)`，swing 是 float），
+        x0 以整数步进、永远等不到那个小数 x1 → **while True 死循环**，
+        表现为"渲染第 1 帧超时"，且和 t 无关（第 0 帧就卡）。
+
+        这不是靠改缓存里那一段代码能解决的：LLM 会持续生成这种写法，
+        所以在绘图原语的入口统一强转，把错误挡在这里。
+        """
+        x0, y0, x1, y1 = _iv(x0), _iv(y0), _iv(x1), _iv(y1)
         dx = abs(x1 - x0)
         dy = -abs(y1 - y0)
         sx = 1 if x0 < x1 else -1

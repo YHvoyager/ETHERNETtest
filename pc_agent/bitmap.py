@@ -51,6 +51,7 @@ GLYPH_H = 16
 GLYPH_BYTES = (GLYPH_W * GLYPH_H) // 8  # 32 字节
 
 DEFAULT_FACE = "SimSun"  # 宋体，小字号笔画清楚
+_DOT_THRESHOLD = 96      # 灰阶 >= 此值算 "亮点"，见 _render_sized() 里的说明
 
 # 进程内缓存：字 -> 32 字节点阵
 _cache: Dict[Tuple[str, str, int], bytes] = {}
@@ -302,7 +303,11 @@ def _render_sized(ch: str, face: str, size: int, w: int, h: int) -> bytes:
     out = bytearray(row_bytes * h)
     for j in range(h):
         for i in range(w):
-            if buf[(j * w + i) * 4] >= 128:
+            # GDI 开着抗锯齿，笔画边缘是灰阶。判 "亮" 的阈值越低笔画越粗：
+            #   128（半亮）→ 16px 宋体的横竖会断成虚线，看不清
+            #    96        → 笔画连上，且不至于糊成一片
+            # 用 <100 会开始出现 "墨团"（撇捺粘连）。
+            if buf[(j * w + i) * 4] >= _DOT_THRESHOLD:
                 bit_index = j * w + i
                 out[bit_index >> 3] |= 0x80 >> (bit_index & 7)
 

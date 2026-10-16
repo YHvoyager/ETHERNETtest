@@ -554,7 +554,7 @@ PCF8574 上的 ETH_RESET**）都会 `HAL_BUSY` —— 因为 DMA 传完只说明
 |---|---|---|
 | `FB <1024 字节>` | 1024 | 不带序号，板子只按长度识别 |
 | `FBSEQ <u16 LE 序号> <1024 字节>` | **1032** | 带序号，抗 UDP 乱序/重复 |
-| `FB?` | 文本 | 回 `FB: good=N bad=N ooo=N` |
+| `FB?` | 文本 | 回 `FB: good=N bad=N ooo=N resync=N` |
 
 **帧格式（与 SSD1306 页寻址完全一致，板子收到后一个字节都不用改）**：
 
@@ -567,8 +567,25 @@ bit  = y & 7          // bit0 在最上面
 按序号处理；`len == 1024` 直接当整帧。其它长度一律 `return 0` 交回文本
 路径 —— 文本命令上限 191 字节，**永远不会撞上**。
 
-**序号比较用 `int16_t` 差值**：`if ((int16_t)(seq - s_next_seq) <= 0) { s_ooo++; }`
-—— 这样 u16 回绕是正确的（0xFFFF → 0x0000 不会误判成倒退）。
+**序号判据（踩过两次坑，别再改回去）**：
+
+判重**只在"同一个会话"内生效**，会话之间靠**时间间隔**切分，不靠序号差值。
+`FB_SESSION_GAP_MS = 500`：距上一帧超过 500ms 就认为 PC 那边换了新进程，
+把 `s_have_seq` 清零、`s_resync++`，新序号直接接受并重建基线。
+
+会话内才用 `int16_t` 差值判迟到：`d = (int16_t)(seq - s_next_seq)`，
+`d <= 0` 一律丢（`s_ooo++`）。u16 回绕靠 `int16_t` 差值处理
+（0xFFFF → 0x0000 不会误判成倒退）。
+
+> ⚠ **不要改回"靠序号差值判新会话"**（曾经的 `FB_SEQ_WINDOW = 128` 版本）。
+> 那种做法只能拦住"回退超过 128 帧"，而 PC 每次重跑都从 `seq=0` 开始：
+> 只要板子停在上次会话的期望值 48，`0 - 48 = -48` 落在窗口内 →
+> **新会话的前 48 帧全被当迟到包丢掉**，表现为"第一个动画能动、第二个不动"。
+> 根本错误是**用序号去猜时间**："回退 48"既可能是 1ms 内的真乱序，
+> 也可能是 3 秒前那个进程留下的旧基线，光看序号分不出来。
+
+> ⚠ **500ms 这个阈值不能调太小**：`--fps 1` 的帧间隔是 1000ms，
+> 阈值小于 1000 会让每一帧都被当成"新会话"，判重彻底失效。
 
 **分发点必须在 `echo_recv()` 的最前面**（记住发信人之后、"取出原文"之前）：
 后面的「对齐字符边界 + 过滤控制字符」会把二进制数据毁掉（`0x00` 被替成 `.`）。
@@ -591,8 +608,8 @@ bit  = y & 7          // bit0 在最上面
 | `proto.py` | UDP 通道：`send_text()` 文本命令 + `send_frame()` 二进制帧 |
 | `canvas.py` | 128×64 画布 + 全套画图原语 + 6x8 ASCII 字体 |
 | `bitmap.py` | 中文点阵渲染（Windows GDI，无需第三方库） |
-| `anim.py` | 内置示例动画：`eyes` / `horse` / `rain` / `boing` / `text` |
-| `sandbox.py` | 沙箱：import 白名单 + 名字白名单 + 超时 |
+| `anim.py` | 内置示例动画：`eyes` / `eyes_fast` / `horse` / `rain` / `boing` / `text` / `car` / `fireworks` |
+| `sandbox.py` | 沙箱：import 白名单 + 名字白名单 + 超时；注入 `draw_text()` 供 LLM 写中文 |
 | `agent.py` | CLI、LLM 调用、播放循环、代码缓存 |
 | `code_cache/` | LLM 写成功过的代码（自动生成，按描述哈希索引） |
 
@@ -607,6 +624,41 @@ bit  = y & 7          // bit0 在最上面
 | **按绝对时间轴对齐，不 `sleep(1/fps)`** | 渲染耗时会累积成系统性帧率偏低 |
 | **代码落盘缓存** | 这就是 skill accumulation：知识在文件里不在权重里。第一次 3 秒，第二次 0 秒 |
 | **中文走 PC 点阵，不给板子加字库** | 板子侧只需"收 1024 字节画一屏"这一件事；内容的复杂度留在 PC 端，改动画不用重新烧固件 |
+| **绘图原语入口强制 `int()` 坐标** | 见下面的"float 坐标死循环"，这是 LLM 生成代码的高频写法，必须在原语层兜住而不是逐个修缓存 |
+| **沙箱注入辅助函数，不放行 `import bitmap`** | 放行会把 gdi32/ctypes 暴露进沙箱，且 GDI 句柄有进程级上限，子线程反复进出不安全。注入一个绑好的 `draw_text()` 既给了能力又没开新面 |
+| **辅助函数起名 `draw_text` 而不是 `text`** | LLM 会把 `text` 当普通名词当变量名（缓存里真出现过 `text = "NI HAO"`），一旦局部变量遮蔽了注入的全局函数，调用时报 `'str' object is not callable`。动词开头不会被这么用 |
+
+### 3.13 ⚠ float 坐标会让 Bresenham 死循环（PC 端，踩过一次）
+
+**现象**：`python pc_agent\\agent.py "..."` 报
+`渲染第 1 帧失败：渲染超时（>1.0 秒）`，且**与 `t` 无关**（第 0 帧就卡）。
+`--fps` 调多低都一样，因为根本没渲染出第一帧。
+
+**根因**：`pc_agent/canvas.py` 的 `line()` 是 Bresenham，终止判据是
+`if x0 == x1 and y0 == y1: break` 的**精确相等**。LLM 生成的代码常写
+`c.line(int(x), y - 12, int(x) - 3 + swing, y, True)`（`swing` 是 float）：
+- `x1` 是 float（如 `14.736`），`x0` 是 int
+- `sx = -1`，每次 `x0 += sx` 保持整数步进
+- **`x0` 永远不可能 `== 14.736`** → `while True` 永不退出
+
+**修法**：`pc_agent/canvas.py` 新增模块级 `_iv(v)`，`line` / `hline` /
+`vline` / `rect` / `fill_rect` 入口全部先 `_iv()` 强转。
+`int()` 是截断不是四舍五入，坐标差 1 像素看不出来，换来"任何数字进来都不会死循环"。
+
+> **为什么在原语层修而不是改那段缓存代码**：LLM 会持续生成这种写法，
+> 改一个缓存文件治不了本。
+
+**排查教训（重要）**：这个 bug 拖了很久才定位，因为症状像"性能问题"。
+走过的弯路：
+1. 先怀疑帧率/网络/板子 —— 全错，`timeout=5` 的**离线**测试也卡死
+2. 加 `threading.settrace()` 逐行记录卡在哪 —— **trace 一次没触发**（报 `?:0`）。
+   这个信号当时没被读懂：**不是 Python 层循环**（否则每行都会回调）
+3. 差点去改 `threading`/`timeout` 机制 —— 都不是原因
+4. ✅ 最后是**直接读那份缓存代码**，看到 `int(x) - 3 + swing` 才确认
+
+> ⚠ 那个 `settrace` 诊断代码**本身成了 bug**：它的回调要跟着被测代码逐行走，
+> 被测代码死循环时回调也跟着无限跑。已撤掉，现在超时只打一次
+> `faulthandler` 栈（不参与正常路径）。**诊断脚手架不该改变被测系统的行为。**
 
 > ⚠ `pc_agent/` 是**纯 PC 端代码，不参与固件编译**，`CMakeLists.txt` 里
 > 也不需要登记。
@@ -897,6 +949,108 @@ clangd `.cache/`、`__pycache__/`、OS 垃圾文件。
 ## 10. 变更日志
 
 > **每次改动代码后在此追加一条，最新的在最上面。**
+
+### 2026-02-13 — 帧率修复 + FBSEQ 时间判据 + 链路检测搬迁 + 中文/float 坐标
+
+**这是积累多轮的一批改动**（跨了链路修复、OLED 帧率、FBSEQ 判据、PC 端中文与
+沙箱修复）。用户实测确认的部分逐条标注。
+
+#### 固件侧
+
+1. **`ETH_PHY_CheckLink()` 搬到自建文件 `Core/Src/eth_phy.c`**（§3.4 防御策略）。
+   原来链路检测写在 `LWIP/Target/ethernetif.c`，被 CubeMX 重新生成清空后
+   `netif_set_link_up()` 从未被调用 → `netif_is_link_up()` 恒假 → `ip4_route()`
+   返回 NULL → `udp_sendto` 返回 `ERR_RTE(-4)` → **能收不能发**。
+   现在 `ethernetif.c` 里只留一行调用 + 醒目注释，重生成只丢 1 行、一眼可见。
+   同时改为**只在链路状态变化时打印**（`static uint8_t s_last_link`），
+   不再每 100ms 刷屏。
+   ✅ **用户实测验证**：`--check` 的 PING/INFO/FB?/OLED STAT 全部有回包，
+   `[LINK] UP BSR=0x782D autoneg_done=1` 出现。
+
+2. **`framebuf.c` 帧头 memcmp 比错字节数**：`memcmp(data, "FBSEQ ", FB_SEQ_HEADER_BYTES)`
+   里 `FB_SEQ_HEADER_BYTES` 是 8，但字面量 `"FBSEQ "` 只有 6 字节 →
+   把序号 2 字节也算进比较，**只有 seq=0 那一帧能过**。
+   引入 `FB_SEQ_MAGIC_BYTES = 6` 做前缀比较。
+   ✅ **用户实测验证**：`FB: good=80 bad=0 ooo=80` —— `bad` 从 21 变 0。
+
+3. **FBSEQ 序号判据改为"时间切会话"**（详见 §3.11）。
+   曾经用过 `FB_SEQ_WINDOW = 128` 的纯序号窗口版，被实测推翻：
+   连播两个 4 秒动画后 `FB: good=24 bad=0 ooo=72 resync=0` —— 第二个动画
+   序号从 0 开始、差值 -48 落在窗口内，**48 帧全被当迟到包丢掉**。
+   现在用 `FB_SESSION_GAP_MS = 500` 按时间间隔切分会话。
+   `FB_Stats` 输出新增 `resync=%lu`。
+
+4. **`oled.c` 的 `OLED_FlushPoll()` 由二段式改为一次调用发一整页**。
+   原来是"一次调用只走一步"（发换页命令**或**发一页数据），8 页 × 2 步 =
+   **16 次调用**才刷完一屏；主循环约 10ms/圈 → 160ms/帧 ≈ **6.25fps**，
+   与实测 6.7fps 完全吻合 —— **这就是"眼睛看起来不动"的根因**。
+   改为 `OLED_Send(pageCmd,4)` 紧跟 `OLED_Send(s_flush_buf,129)`，
+   删除 `s_flush_stage` 变量。
+   ✅ **用户实测验证**："眼睛都能动了"。
+
+5. **`oled.c` 的 `OLED_ShowFrame()` 忙时不再丢帧、改为从头重刷**。
+   旧逻辑是 `s_flush_active` 为真就 `s_flush_dropped++` 然后 return ——
+   被丢的其实不是新帧，而是**正在刷的那一帧的后半截**，屏上定格成
+   "上帧前几页 + 下帧后几页"的撕裂画面且永远落后半帧。
+   现在忙时也照常 `s_flush_page = 0`、`s_flush_active = 1` 并立刻发第 0 页命令；
+   代价是一页可能重发（129 字节 @400kHz 约 3ms），保证屏幕永远是某帧的完整内容。
+   `s_flush_dropped` 语义随之改为"被中途打断、改为从头重刷的帧数"。
+   ✅ **用户实测验证**："眼睛一开始动了，复位之后就不会动了" → 后经
+   `OLED_Send` 超时恢复修复（`HAL_I2C_Master_Transmit` 的 `HAL_MAX_DELAY`
+   改为带超时）彻底解决，复位后也能动。
+
+#### PC 端（`pc_agent/`）
+
+6. **`agent.py` 的 `_chat_url()`**：用 `re.search(r"/v\d+$", base)` 判断 base 是否
+   已带版本路径。DeepSeek/OpenAI 不带，通义千问
+   `https://dashscope.aliyuncs.com/compatible-mode/v1`、智谱
+   `https://open.bigmodel.cn/api/paas/v4`、本地 Ollama `http://localhost:11434/v1`
+   都自带 —— 简单拼 `/v1/chat/completions` 会 **404**。
+   另新增 `--envcheck` 与 `_KNOWN_ENDPOINTS`（五家常用端点）。
+
+7. **`agent.py` 的 `play()` 调错对象**：`--anim` 传的是**裸函数** `fn(t, params)`，
+   LLM 路径传的是 **`Renderer` 对象**（有 `.render()`）。原代码写死
+   `renderer.render(t, params)` → `AttributeError: 'function' object has no attribute 'render'`。
+   此 bug 一直未暴露是因为板子从未成功回过包。加 `_render_once()` 用
+   `getattr(renderer, "render", None)` 分派。
+
+8. **`anim.py` 新增 `eyes_fast` / `car` / `fireworks`**。
+   - `eyes_fast`：方波式摆动让瞳孔在 ±0.95 之间以 1 秒周期扫动，
+     摆幅是普通 `eyes` 的 4 倍以上 —— 专门用来验证"帧率够不够让画面动起来"
+   - `car`：车身左移循环 + 地面滚动虚线 + 轮速按纯滚动条件
+     `spin = -(t * speed) / max(1, r)`
+   - `fireworks`：`random.seed(20241016)` 保证纯函数，粒子带重力 `age * age * 16`
+
+9. **`bitmap.py` 二值化阈值 `128` → `_DOT_THRESHOLD = 96`**。
+   16px 抗锯齿后二值化，阈值 128 偏高导致笔画断裂。
+
+10. **沙箱注入 `draw_text()`**（详见 §3.12 的设计决策）。
+    `_make_text_helper()` 返回闭包，**内部延迟 `import bitmap`** —— 顶层 import
+    会在非 Windows 平台直接炸，且让 `--envcheck` 之类的诊断路径在缺 GDI 时
+    仍能列出其它原因。
+
+11. **`sandbox.py` 的 `timeout` 1.0 → 3.0 秒**。1 秒对 128×64 的纯画线代码
+    看似极宽松（正常 1ms 内），但假阳性会让整个播放 `break` 退出，
+    用户看到"动画完全没出来"，比多等 2 秒糟得多。
+
+12. **⚠ `canvas.py` 的 float 坐标死循环修复**（详见 §3.13）。
+    这是本批**最重要的 PC 端 bug**：`line()` 的 Bresenham 终止判据
+    `x0 == x1` 要求整数，LLM 写 `int(x) - 3 + swing`（float）就死循环。
+    新增 `_iv()` 在 `line`/`hline`/`vline`/`rect`/`fill_rect` 入口强转。
+    ✅ **离线实测验证**：那份缓存代码从"第 1 帧超时"变成
+    **48 帧 0.010 秒 → 4648 fps**；沙箱自检 10/10 全拦住。
+
+13. **撤掉 `sandbox.py` 里 `threading.settrace()` 诊断**（曾用于定位超时卡在哪行）。
+    它的回调要跟着被测代码逐行走，被测代码死循环时回调也跟着无限跑 ——
+    **诊断脚手架改变了被测系统的行为**。现在超时只打一次 `faulthandler` 栈。
+
+#### 其它
+
+14. **`.gitignore` 新增 pc_agent 临时产物段**：`pc_agent/code_cache/`、
+    `eyes_preview.png`、`*_preview.png`、`car*.txt`、`ascii_*.txt`。
+    `code_cache/` 是随着本机环境变化的运行产物，不适合进版本库。
+
+同步更新 AGENTS.md §3.11 / §3.12 / §3.13（新增）/ §11 待办 / §10 变更日志。
 
 ### 2026-02-13 — 修 `--check` / `--test` 被 API key 挡住
 
@@ -1412,8 +1566,10 @@ GPIOA~GPIOK（`0x40020000`~`0x40023FFF`）与 RCC（`0x40023800`~`0x40023BFF`，
 | 项 | 说明 | 优先级 |
 |---|---|---|
 | **OLED 第 2 步：刷屏真正走 DMA** | 本轮已把 92ms 阻塞拆成 8×2.8ms（见 §10 与 §3.9），主循环响应性已解决，但**用的仍是阻塞 `HAL_I2C_Master_Transmit`，没上 DMA**。`hdma_i2c2_tx`=DMA1_Stream7 / CH7 / MEMORY_TO_PERIPH 已由 CubeMX 生成，`I2C2_EV_IRQHandler` 也已补上（在 `Core/Src/dma.c` / `Core/Src/stm32f4xx_it.c`），但**尚未被 `oled.c` 使用** | **高** |
-| **OLED 第 3 步：`OLED BLIT` + 动眼睛动画** | 用户目标（原话）：「在 OLED 上显示一双会动的眼睛，AI 可以通过修改寄存器等操作直接控制」。**帧缓冲上传（约 1032 字节/帧）才是可行形态，不是逐寄存器写** —— 15~30 fps × 1024 字节用 `W` 一条 4 字节要几十万条命令/秒，物理上做不到。发送侧 `Echo_Service_ReplyBoth()` 已就绪 | **高** |
-| `.mxproject` 追踪 | 见 9.3，尚未决定是否移除追踪 | 低 |
+| ~~**OLED 第 3 步：`OLED BLIT` + 动眼睛动画**~~ | ✅ **已被 `FBSEQ` 通道取代**（见 §3.11 / §3.12）。帧缓冲上传（1032 字节/帧）已跑通，用户实测眼睛能动、LLM 生成的篮球动画也能显示 | 已完成 |
+| **中文动画端到端验证** | `draw_text()` 已注入沙箱、提示词已写中文章节，但**用户尚未跑过一次带中文的 LLM 动画** | **高** |
+| **`--ascii` 不指定 `-s` 时应有限时长** | `--seconds` 默认 0 表示无限播，用户在 VS Code 终端里画个不停要 Ctrl+C。应改为 `--ascii` 时默认有限时长 | 中 |
+| **`.mxproject` 追踪** | 见 §9.3，尚未决定是否移除追踪 | 低 |
 | 改用 HSE 25MHz | 当前用 HSI ±1%，UART 波特率有偏差；RMII 参考时钟由 PHY 自己的晶振提供，不影响以太网。属可选优化 | 低 |
 | TCP 应用 | `LWIP_TCP=1` 但工程未写 TCP 应用 | — |
 | `eth_custom_phy_interface.c` | 保留未用（见 5） | — |
@@ -1432,3 +1588,6 @@ GPIOA~GPIOK（`0x40020000`~`0x40023FFF`）与 RCC（`0x40023800`~`0x40023BFF`，
 8. **不要动校验和配置**
 9. **读到的寄存器值脏时，先修通信参数再看数据**
 10. **多个来源冲突时，以原理图 + 实测为准**
+11. **PC 端绘图原语的坐标必须能是 float —— 入口一律 `_iv()` 强转**（见 §3.13）
+12. **FBSEQ 判重只在同一会话内生效，会话由 500ms 时间间隔切分**（见 §3.11）
+13. **诊断脚手架不该改变被测系统的行为**（`settrace` 的教训，见 §3.13）

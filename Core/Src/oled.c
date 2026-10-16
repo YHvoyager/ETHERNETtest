@@ -22,6 +22,7 @@
  *
  */
 #include "oled.h"
+#include "i2c.h"        /* MX_I2C2_Init()：I2C 死锁恢复要用到 */
 #include <math.h>
 #include <stdlib.h>
 
@@ -70,9 +71,12 @@ uint8_t OLED_GRAM[OLED_PAGE][OLED_COLUMN];
  * =========================================================================== */
 static uint8_t  s_flush_buf[OLED_COLUMN + 1];
 static uint8_t  s_flush_active  = 0U;   /* 1 = 后台正在刷屏 */
-static uint8_t  s_flush_stage   = 0U;   /* 0 = 刚发完换页命令，1 = 刚发完数据 */
 static uint8_t  s_flush_page    = 0U;
+/* 【语义已变】被中途打断、改为"从头重刷"的帧数。
+ * 不再是"被丢掉的帧"——那些帧的内容仍在 OLED_GRAM 里，只是从头又刷了一遍。
+ * 这个计数现在只用来观察"发送速率是否超过刷屏速率"，不表示画面丢了内容。 */
 static uint32_t s_flush_dropped = 0U;
+static uint32_t s_flush_wait    = 0U;   /* 连续多少次看到 hi2c2 非 READY（看门狗用） */
 
 // ========================== 底层通信函数 ==========================
 
@@ -83,9 +87,75 @@ static uint32_t s_flush_dropped = 0U;
  * @return None
  * @note 此函数是移植本驱动时的重要函数 将本驱动库移植到其他平台时应根据实际情况修改此函数
  */
+/* 【本工程改动】把 HAL_MAX_DELAY 换成有限超时 + 失败后总线恢复
+ *
+ * 为什么必须改：
+ *   原版这里是 HAL_MAX_DELAY（无限等待）。I2C2 上挂着**两个**从机 ——
+ *   SSD1306（OLED，0x78）和 PCF8574（0x20，管 ETH_RESET）。复位/上电时
+ *   SSD1306 可能正处于"发 ACK"的中途，复位后把 SDA 钳在低电平不放；
+ *   这时 HAL_I2C_Master_Transmit(HAL_MAX_DELAY) 会**永远等不到**总线空闲。
+ *
+ *   后果不是"刷屏慢"，而是**主循环彻底卡死**：OLED_FlushPoll() 在
+ *   main() 的 while(1) 里，它一卡，MX_LWIP_Process() 就再也跑不到 ——
+ *   板子在网络上"看起来活着"（lwIP 的收发由中断驱动），但除了 ping
+ *   什么都不应，屏幕定格。实测现象就是"上电能动，复位后不动"。
+ *
+ * 恢复办法（标准 I2C 总线解锁流程）：
+ *   1. 反初始化 I2C2，把 SCL/SDA 释放回 GPIO，总线不再被外设驱动；
+ *   2. 手动打 9 个 SCL 脉冲 —— 从机（SSD1306）看到时钟就会把剩下的
+ *      数据位/ACK 位吐完，然后释放 SDA；
+ *   3. 发一个 STOP 条件，把总线状态机复位；
+ *   4. 重新 MX_I2C2_Init() 拿回外设。
+ * ========================================================================= */
+void OLED_I2C_Recover(void)
+{
+  GPIO_InitTypeDef gpio = {0};
+  uint8_t i;
+
+  HAL_I2C_DeInit(&hi2c2);
+
+  /* SCL=PH4, SDA=PH5，开漏 + 内部上拉（模块上通常还有 4.7k 外部上拉） */
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  gpio.Pin   = GPIO_PIN_4 | GPIO_PIN_5;
+  gpio.Mode  = GPIO_MODE_OUTPUT_OD;
+  gpio.Pull  = GPIO_PULLUP;
+  gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOH, &gpio);
+  HAL_GPIO_WritePin(GPIOH, GPIO_PIN_4 | GPIO_PIN_5, GPIO_PIN_SET);
+  HAL_Delay(1);
+
+  /* 9 个时钟脉冲：足够把一个卡在半途的字节（8 位数据 + 1 位 ACK）走完 */
+  for (i = 0U; i < 9U; i++)
+  {
+    HAL_GPIO_WritePin(GPIOH, GPIO_PIN_4, GPIO_PIN_RESET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOH, GPIO_PIN_4, GPIO_PIN_SET);
+    HAL_Delay(1);
+  }
+
+  /* STOP 条件：SDA 在 SCL 为高时由低变高 */
+  HAL_GPIO_WritePin(GPIOH, GPIO_PIN_5, GPIO_PIN_RESET);
+  HAL_Delay(1);
+  HAL_GPIO_WritePin(GPIOH, GPIO_PIN_4, GPIO_PIN_SET);
+  HAL_Delay(1);
+  HAL_GPIO_WritePin(GPIOH, GPIO_PIN_5, GPIO_PIN_SET);
+  HAL_Delay(1);
+
+  /* 把引脚交还给 I2C2 */
+  MX_I2C2_Init();
+}
+
 void OLED_Send(uint8_t *data, uint8_t len)
 {
-  HAL_I2C_Master_Transmit(&hi2c2, OLED_ADDRESS, data, len, HAL_MAX_DELAY);
+  /* 20ms 对 129 字节 @100kHz（约 12ms）留了足够余量，
+   * 又远小于人能察觉的卡顿。 */
+  if (HAL_I2C_Master_Transmit(&hi2c2, OLED_ADDRESS, data, len, 20U) != HAL_OK)
+  {
+    OLED_I2C_Recover();
+
+    /* 恢复后重试一次；再失败就放弃这一笔（丢一页比卡死主循环好得多） */
+    (void)HAL_I2C_Master_Transmit(&hi2c2, OLED_ADDRESS, data, len, 20U);
+  }
 }
 
 /**
@@ -220,21 +290,30 @@ void OLED_NewFrame()
  */
 void OLED_ShowFrame()
 {
+  /* 【本工程改动】"忙"时不再丢弃新帧，而是**从头重刷**。
+   *
+   * 原来是"s_flush_active 为真就 s_flush_dropped++ 然后 return"。这个策略
+   * 有个隐蔽的致命伤：调用方（framebuf.c 的 fb_show()）是**先 memcpy 好
+   * OLED_GRAM，再调本函数**的。所以被丢弃的不是"新一帧"，而是"正在刷的
+   * 那一帧的后半截"—— 屏幕会定格成"上一帧的前几页 + 新帧的后几页"的
+   * 撕裂画面，而且永远落后半帧。
+   *
+   * 重刷的代价只是那一页可能重复发一次（一页 129 字节 @400kHz 约 3ms），
+   * 却保证了屏幕上看到的永远是**某一帧的完整内容**。
+   *
+   * ⚠ 注意这里不重置 s_flush_page 也没关系 —— 下面重新从 0 开始排，
+   *   重复发出的页只是被同一份新数据覆盖，不会画错。 */
   if (s_flush_active != 0U)
   {
-    /* 上一帧还没发完。丢掉这一帧不会画错，只是慢一帧 —— 比让调用者
-     * 阻塞 92ms 好。屏幕本来就是"最新一帧生效"，中间帧没人看。 */
     s_flush_dropped++;
-    return;
   }
 
-  s_flush_page = 0U;
-  s_flush_dropped = 0U;
+  s_flush_page   = 0U;
   s_flush_active = 1U;
 
-  /* 立刻启动第一页 —— 这样调用者返回时总线上已经有数据在动，
+
+  /* 立刻发第一页 —— 这样调用者返回时总线上已经有数据在动，
    * 不需要等第一次 OLED_FlushPoll()。 */
-  s_flush_stage = 0U;
   {
     static uint8_t pageCmd[4] = {0x00, 0xB0, 0x00, 0x10};
     pageCmd[1] = (uint8_t)(0xB0 + 0);
@@ -259,20 +338,48 @@ uint8_t OLED_FlushPoll(void)
    * 这一句是整个方案的关键：不在这里等，主循环才有机会跑 lwIP。 */
   if (hi2c2.State != HAL_I2C_STATE_READY)
   {
+    /* 【本工程改动】加看门狗。
+     *
+     * 原版这里只 return，如果 State 因为某种原因永远回不到 READY
+     * （比如 HAL 内部状态机被总线错误卡住），s_flush_active 就永远
+     * 是 1，OLED_ShowFrame() 之后每一帧都会被判成"上一帧没发完"丢掉
+     * —— 屏幕就永久定格，而且 OLED STAT 里 busy=1 但 dropped 不涨，
+     * 完全看不出问题在哪。
+     *
+     * 这里数连续多少次看到非 READY：超过 200 次（主循环约 10ms/圈，
+     * 即约 2 秒）就认定外设状态机坏了，强制清掉 s_flush_active 并
+     * 重置 I2C2，让刷屏能重新开始。宁可丢一帧，也不要永久僵死。 */
+    s_flush_wait++;
+    if (s_flush_wait > 200U)
+    {
+      s_flush_wait   = 0U;
+      s_flush_active = 0U;
+      OLED_I2C_Recover();
+      return 0U;
+    }
     return 1U;
   }
+  s_flush_wait = 0U;   /* 见到 READY 就清零，正常路径不会累积 */
 
-  if (s_flush_stage == 0U)
+  /* 【性能关键】一次调用发**一整页**（换页命令 + 129 字节数据），
+   * 而不是"发命令"、"发数据"各占一次调用。
+   *
+   * 早先是二段式状态机（一次调用只走一步），结果刷完一屏要 16 次调用。
+   * 主循环转一圈约 10ms（MX_LWIP_Process + 心跳），16 圈 = 160ms/帧，
+   * 实测正好是约 6.7fps —— 远低于 400kHz 下应有的约 40fps。
+   *
+   * 现在一次调用发一页，8 次调用刷完一屏，帧率提到约 12fps 以上。
+   * 整页独占总线还有个好处：不会被 PCF8574 的访问插进来把一页切成两半。 */
   {
-    /* 换页命令已经发完，接着发这一页的 129 字节（0x40 控制字节 + 128 数据） */
+    static uint8_t pageCmd[4] = {0x00, 0xB0, 0x00, 0x10};
+    pageCmd[1] = (uint8_t)(0xB0 + s_flush_page);
+    OLED_Send(pageCmd, 4);
+
     s_flush_buf[0] = 0x40;
     memcpy(s_flush_buf + 1, OLED_GRAM[s_flush_page], OLED_COLUMN);
     OLED_Send(s_flush_buf, OLED_COLUMN + 1);
-    s_flush_stage = 1U;
-    return 1U;
   }
 
-  /* 一页发完，准备下一页 */
   s_flush_page++;
   if (s_flush_page >= OLED_PAGE)
   {
@@ -280,12 +387,6 @@ uint8_t OLED_FlushPoll(void)
     return 0U;
   }
 
-  {
-    static uint8_t pageCmd[4] = {0x00, 0xB0, 0x00, 0x10};
-    pageCmd[1] = (uint8_t)(0xB0 + s_flush_page);
-    OLED_Send(pageCmd, 4);
-  }
-  s_flush_stage = 0U;
   return 1U;
 }
 

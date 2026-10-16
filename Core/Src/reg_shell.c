@@ -7,9 +7,11 @@
 
 #include "reg_shell.h"
 #include "board_io.h"
-#include "ssd1306.h"
+#include "oled.h"        /* 波特律动 SSD1306 驱动（128x64，I2C2 PH4/PH5） */
+#include "font.h"        /* font16x16 / afont16x8 字库 */
 #include "echo_service.h"
 #include "main.h"
+#include "i2c.h"        /* hi2c2 —— OLED RAW 子命令要用它读 HAL 错误码 */
 
 #include <stdio.h>
 #include <string.h>
@@ -236,11 +238,14 @@ static const char *const s_help_text =
   "  RB <addr>          read one byte\r\n"
   "  WB <addr> <val>    write one byte\r\n"
   "  OLED               show what is currently on the OLED\r\n"
-  "  OLED SCAN          scan I2C2 bus (is the panel alive?)\r\n"
-  "  OLED CLR           clear screen (no argument = re-flush)\r\n"
-  "  OLED TXT <l> <t>   write text on line l (0..3)\r\n"
-  "  OLED RAW <hex>     send hex register bytes, bypassing the driver\r\n"
-  "  OLED PIX <x> <y> [0|1]  draw one pixel\r\n"
+  "  OLED INIT          re-init the panel (use if the screen is dark)\r\n"
+  "  OLED ON / OFF      panel power, RAM content untouched\r\n"
+  "  OLED CLR / FILL    all pixels off / all pixels on\r\n"
+  "  OLED TXT <l> <t>   write text on line l (0..3), 16px tall\r\n"
+  "  OLED REFRESH       redraw all 4 lines from the line cache\r\n"
+  "  OLED PIX <x> <y> [0|1]    draw one pixel\r\n"
+  "  OLED BAR <x> <y> <w> <h> [0|1]   filled rectangle\r\n"
+  "  OLED RAW <ctrl> <hex...>  send raw I2C bytes, bypassing the driver\r\n"
   "  BROADCAST [port]   mirror frames to a 2nd socket (0 = off)\r\n"
   "  PING               liveness check the PC can use to probe the board\r\n"
   "examples: LED0  |  LED 1 1  |  W 40020014 3  |  OLED TXT 0 HELLO\r\n";
@@ -483,42 +488,93 @@ static int cmd_write(uint32_t addr, uint32_t val, int is_byte,
 }
 
 /* ------------------------------------------------------------------------- */
-/* OLED 命令                                                                   */
+/* OLED 命令（走波特律动驱动 oled.c + font.c）                                  */
 /* ------------------------------------------------------------------------- */
+
+/* 屏幕几何。
+ * ⚠ oled.c 把 OLED_PAGE / OLED_COLUMN / OLED_ROW 定义在 .c 内部而**没有放进
+ * oled.h**，所以这里自己写一份。好处是：将来重新导入波特律动的 oled.c/oled.h
+ * 不会因为多出/少掉宏而破坏本文件。
+ * 128x64：8 页 × 128 列 = 1024 字节显存。 */
+#define OLED_X_MAX     127U
+#define OLED_Y_MAX      63U
+#define OLED_PAGES_V    8U
+#define OLED_COLS_V   128U
+#define OLED_GRAM_BYTES ((uint32_t)OLED_PAGES_V * OLED_COLS_V)
+
+/* 波特律动把 SSD1306 的 8 位 I2C 地址写成 OLED_ADDRESS = 0x78（= 7 位 0x3C << 1），
+ * 定义在 oled.c 内部，同样没导出。这里自己写一份。 */
+#define OLED_ADDR_8BIT  0x78U
+#define OLED_XFER_TIMEOUT 100U
+
+/* 波特律动的显存。它在 oled.c 里是**非 static 全局**（oled.c: `uint8_t
+ * OLED_GRAM[OLED_PAGE][OLED_COLUMN];`），只是 oled.h 没导出，所以这里自己 extern。 */
+extern uint8_t OLED_GRAM[OLED_PAGES_V][OLED_COLS_V];
+
+/* 波特律动的打印函数形参是 char*（非 const），传字符串字面量会告警。
+ * 这些是 static，不占栈（本工程栈只有 1KB）。 */
+static char s_oled_txt_buf[SHELL_MAX_LINE];
+
+/* 四行文本的"影子"。
+ *
+ * 【为什么需要它】波特律动是全屏重绘模型：OLED_NewFrame() 把显存清成
+ * "全灭"，然后你画什么是什么，OLED_ShowFrame() 把整个显存推给屏。
+ * 所以 OLED TXT <line> <text> 不能只画一行 —— 那样其它三行会被清掉。
+ * 这里记住每行最后一次的内容，每次 TXT 都**整屏四行一起重画**。
+ *
+ * 行高 16 像素（font16x16 是 16x16，ASCII 走内置 afont16x8，也是 16 高）。
+ * 128 列 ÷ 16 宽 = 8 个汉字；ASCII 是 8 宽所以能放 16 个。
+ * 缓冲按字节给 64，够 16 个 ASCII 加余量；超了会被截断。 */
+static char s_oled_lines[4][64];
+
+/**
+  * @brief  按 s_oled_lines[] 把整屏四行重画出来
+  * @note   中文字符走 font16x16 字库（font.c 里的 zh16x16，当前只含"波特律动"
+  *         4 个字）；字库里没有的字符若是 ASCII 则退化成内置 afont16x8 显示，
+  *         中文则显示成空格 —— 波特律动 OLED_PrintString 内部就是这么处理的。
+  */
+static void oled_redraw_lines(void)
+{
+  uint8_t i;
+
+  OLED_NewFrame();
+  for (i = 0U; i < 4U; i++)
+  {
+    OLED_PrintString(0U, (uint8_t)(i * 16U), s_oled_lines[i],
+                     &font16x16, OLED_COLOR_NORMAL);
+  }
+  OLED_ShowFrame();
+}
 
 /**
   * @brief  把整屏内容以文本形式描述出来（4 行 × 16 字符）
-  * @note   面板上的**中文字库方块**和**未知字符**在这里显示成 '.',
-  *         因为它们在图形缓冲里本来就是像素，没有字符可还原。
+  * @note   直接读波特律动的显存 OLED_GRAM[page][column]。
+  *         中文字库方块和未知字符在这里显示成 '#'/'，因为它们在显存里
+  *         本来就是像素，没有字符可还原。
   */
 static int cmd_oled_show(char *out, uint32_t out_size)
 {
-  const uint8_t *buf = SSD1306_GetBuffer();
-  uint32_t       used;
-  uint8_t        line;
-  uint8_t        col;
-  int            n;
+  uint32_t used;
+  uint8_t  line;
+  uint8_t  col;
+  int      n;
 
-  n = snprintf(out, (size_t)out_size, "OLED 128x64 (I2C2):\r\n");
+  n = snprintf(out, (size_t)out_size, "OLED 128x64 (BaudDance, I2C2 PH4/PH5):\r\n");
   if (n < 0) { return -1; }
   used = (uint32_t)n;
 
-  /* 每行 16 个字符 × 8 像素 = 128 列；每行 16 像素高 = 2 页 */
+  /* 每行 16 格 × 8 像素 = 128 列；每行 16 像素高 = 2 页 */
   for (line = 0U; line < 4U; line++)
   {
-    uint8_t page = (uint8_t)(line * 2U);
-
     if (used + 20U >= (uint32_t)out_size) { break; }
 
     out[used++] = '|';
 
     for (col = 0U; col < 16U; col++)
     {
-      /* 直接用图形缓冲判断"这一格有没有点亮的像素"，
-       * 不反查字库 —— 缓冲区里存的是像素，不是字符。 */
-      uint8_t  i;
-      uint8_t  row;
-      uint8_t  any = 0U;
+      uint8_t i;
+      uint8_t row;
+      uint8_t any = 0U;
 
       for (i = 0U; i < 8U; i++)
       {
@@ -526,10 +582,9 @@ static int cmd_oled_show(char *out, uint32_t out_size)
         {
           uint8_t px  = (uint8_t)(col * 8U + i);
           uint8_t py  = (uint8_t)(line * 16U + row);
-          uint8_t pg  = (uint8_t)(py >> 3);
-          uint8_t bit = (uint8_t)(py & 7U);
 
-          if ((buf[(uint16_t)pg * SSD1306_WIDTH + px] & (uint8_t)(1U << bit)) != 0U)
+          /* 波特律动：bit=1 表示**灭**，bit=0 表示亮（见 OLED_SetPixel） */
+          if ((OLED_GRAM[py >> 3][px] & (uint8_t)(1U << (py & 7U))) == 0U)
           {
             any = 1U;
           }
@@ -553,60 +608,63 @@ static int cmd_oled_show(char *out, uint32_t out_size)
   */
 static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
 {
-  int n;
-
   /* ---- OLED（无参数）= 把屏上内容读回来 ---- */
   if (ntok < 2UL)
   {
     return cmd_oled_show(out, out_size);
   }
 
-  /* ---- OLED SCAN ---- */
-  if (strcmp(tok[1], "SCAN") == 0)
+  /* ---- OLED INIT ---- 重新初始化
+   *
+   * 【为什么需要这条命令】上电时 SSD1306 模块可能还没准备好（模块上的复位
+   * 电容要充电），此时初始化会失败，屏一直黑着。原来 ssd1306.c 的写法是
+   * 探测失败就 return，整个初始化放弃 —— 实测就是这个坑：开机报
+   * "no ACK from 0x78"，但几十秒后 OLED SCAN 明明能扫到 0x3C。
+   * 现在换成波特律动（不探测，直接写），再留这条命令作为手动补救。 */
+  if (strcmp(tok[1], "INIT") == 0)
   {
-    uint32_t found = SSD1306_I2CScan(out, out_size);
-    if (found == 0UL)
-    {
-      return -1;
-    }
-    /* 顺带报一下 0x3C 在不在，这是最常问的问题 */
-    if (strstr(out, "0x3C") == NULL)
-    {
-      uint32_t used = (uint32_t)strlen(out);
-      if (used + 48U < out_size)
-      {
-        (void)snprintf(out + used, (size_t)(out_size - used),
-                       "note: 0x3C (SSD1306) NOT found -> wiring/power, not driver\r\n");
-      }
-    }
+    OLED_Init();
+    OLED_NewFrame();
+    (void)snprintf(out, (size_t)out_size, "OK OLED_Init() + OLED_NewFrame()\r\n");
     return 1;
   }
 
-  /* ---- OLED CLR ---- */
+  /* ---- OLED ON / OFF ---- 显存不动，只开关面板 */
+  if (strcmp(tok[1], "ON") == 0)
+  {
+    OLED_DisPlay_On();
+    (void)snprintf(out, (size_t)out_size, "OK display on\r\n");
+    return 1;
+  }
+  if (strcmp(tok[1], "OFF") == 0)
+  {
+    OLED_DisPlay_Off();
+    (void)snprintf(out, (size_t)out_size, "OK display off\r\n");
+    return 1;
+  }
+
+  /* ---- OLED CLR ---- 清空显存并刷屏 */
   if (strcmp(tok[1], "CLR") == 0)
   {
-    SSD1306_Clear(0U);
-    n = SSD1306_Flush();
-    if (n != 0)
-    {
-      (void)snprintf(out, (size_t)out_size,
-                     "ERR: flush failed (%d), I2C err=0x%08lX\r\n",
-                     n, (unsigned long)HAL_I2C_GetError(&hi2c2));
-      return -1;
-    }
+    OLED_NewFrame();
+    OLED_ShowFrame();
     (void)snprintf(out, (size_t)out_size, "OK OLED cleared\r\n");
     return 1;
   }
 
-  /* ---- OLED FILL ---- */
+  /* ---- OLED FILL ---- 全部点亮
+   * 波特律动的语义：显存里 bit=1 表示**灭**，bit=0 表示亮。
+   * OLED_NewFrame() 用 memset 把显存全填 0 → 那是全亮，不是全灭。
+   * 所以"全亮"= NewFrame 之后直接刷；"全灭"= 全填 0xFF 再刷。 */
   if (strcmp(tok[1], "FILL") == 0)
   {
-    SSD1306_Clear(1U);
-    n = SSD1306_Flush();
-    (void)snprintf(out, (size_t)out_size,
-                   (n == 0) ? "OK OLED filled (all pixels on)\r\n"
-                            : "ERR: flush failed\r\n");
-    return (n == 0) ? 1 : -1;
+    uint32_t i;
+
+    OLED_NewFrame();          /* 显存全 0 = 全亮 */
+    for (i = 0U; i < 4U; i++) { s_oled_lines[i][0] = '\0'; }
+    OLED_ShowFrame();
+    (void)snprintf(out, (size_t)out_size, "OK OLED filled (all pixels on)\r\n");
+    return 1;
   }
 
   /* ---- OLED PIX <x> <y> [0|1] ---- */
@@ -614,7 +672,7 @@ static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
   {
     uint32_t x;
     uint32_t y;
-    uint8_t  on = 1U;
+    OLED_ColorMode color = OLED_COLOR_NORMAL;
 
     if (ntok < 4UL)
     {
@@ -627,33 +685,35 @@ static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
       (void)snprintf(out, (size_t)out_size, "ERR: x/y must be decimal\r\n");
       return -1;
     }
-    if (x >= SSD1306_WIDTH || y >= SSD1306_HEIGHT)
+    if ((x > OLED_X_MAX) || (y > OLED_Y_MAX))
     {
       (void)snprintf(out, (size_t)out_size,
                      "ERR: out of range (x 0..%u, y 0..%u)\r\n",
-                     (unsigned int)(SSD1306_WIDTH - 1U),
-                     (unsigned int)(SSD1306_HEIGHT - 1U));
+                     (unsigned int)OLED_X_MAX, (unsigned int)OLED_Y_MAX);
       return -1;
     }
-    if (ntok >= 5UL)
+    if ((ntok >= 5UL) && (tok[4][0] == '0'))
     {
-      on = (tok[4][0] == '0') ? 0U : 1U;
+      color = OLED_COLOR_REVERSED;   /* 第二个参数是 0 -> 灭掉这个点 */
     }
 
-    SSD1306_DrawPixel((uint8_t)x, (uint8_t)y, on);
-    n = SSD1306_Flush();
-    (void)snprintf(out, (size_t)out_size,
-                   "OK OLED (%u,%u) = %s\r\n",
-                   (unsigned int)x, (unsigned int)y, (on != 0U) ? "ON" : "OFF");
-    return (n == 0) ? 1 : -1;
+    /* 波特律动语义：NORMAL=点亮，REVERSED=熄灭（显存里 1 是灭） */
+    OLED_SetPixel((uint8_t)x, (uint8_t)y, color);
+    OLED_ShowFrame();
+
+    (void)snprintf(out, (size_t)out_size, "OK OLED (%u,%u) = %s\r\n",
+                   (unsigned int)x, (unsigned int)y,
+                   (color == OLED_COLOR_NORMAL) ? "ON" : "OFF");
+    return 1;
   }
 
-  /* ---- OLED TXT <line> <text...> ----
+  /* ---- OLED TXT <line 0..3> <text...> ----
    * 文本可以带空格，所以从 tok[3] 起要**拼回去**，不能用单个 token。 */
   if (strcmp(tok[1], "TXT") == 0)
   {
     uint32_t line;
-    uint8_t  y;
+    uint32_t used = 0UL;
+    uint32_t i;
 
     if (ntok < 4UL)
     {
@@ -669,61 +729,93 @@ static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
     if (line > 3UL)
     {
       (void)snprintf(out, (size_t)out_size,
-                     "ERR: line must be 0..3 (4 lines of 16 chars)\r\n");
+                     "ERR: line must be 0..3 (4 lines of 16px)\r\n");
       return -1;
     }
 
-    y = (uint8_t)(line * 16U);
-
-    /* 先擦掉这一行（两页），否则新文本比旧文本短时会留下尾巴 */
-    SSD1306_DrawString(0U, y,        "                ", 0U);
-    SSD1306_DrawString(0U, (uint8_t)(y + 8U), "                ", 0U);
-
-    /* 把 tok[3..] 用空格拼回来 */
+    /* 把 tok[3..] 用空格拼回来。
+     * ⚠ 波特律动是全屏重绘模型：OLED_NewFrame() 会把显存清掉，所以这里
+     * 不能只画这一行 —— 那会把其它三行一起抹掉。s_oled_lines[] 记住每行
+     * 最后一次的内容，oled_redraw_lines() 整屏四行一起重画。 */
+    for (i = 3UL; i < ntok; i++)
     {
-      char    joined[SHELL_MAX_LINE];
-      uint32_t used = 0UL;
-      uint32_t i;
+      size_t tl = strlen(tok[i]);
 
-      joined[0] = '\0';
-      for (i = 3UL; i < ntok; i++)
+      if (used + tl + 2U >= sizeof(s_oled_txt_buf))
       {
-        size_t tl = strlen(tok[i]);
-
-        if (used + tl + 2U >= sizeof(joined))
-        {
-          break;
-        }
-        if (i > 3UL)
-        {
-          joined[used++] = ' ';
-        }
-        memcpy(joined + used, tok[i], tl);
-        used += (uint32_t)tl;
-        joined[used] = '\0';
+        break;
       }
-
-      SSD1306_DrawString(0U, y, joined, 1U);
+      if (i > 3UL)
+      {
+        s_oled_txt_buf[used++] = ' ';
+      }
+      memcpy(s_oled_txt_buf + used, tok[i], tl);
+      used += (uint32_t)tl;
+      s_oled_txt_buf[used] = '\0';
     }
 
-    n = SSD1306_Flush();
-    if (n != 0)
+    /* 记住这一行，供 OLED REFRESH 整体重绘 */
+    {
+      size_t tl = strlen(s_oled_txt_buf);
+      if (tl > sizeof(s_oled_lines[0]) - 1U) { tl = sizeof(s_oled_lines[0]) - 1U; }
+      memcpy(s_oled_lines[line], s_oled_txt_buf, tl);
+      s_oled_lines[line][tl] = '\0';
+    }
+
+    oled_redraw_lines();
+
+    (void)snprintf(out, (size_t)out_size, "OK OLED line %u = \"%s\"\r\n",
+                   (unsigned int)line, s_oled_lines[line]);
+    return 1;
+  }
+
+  /* ---- OLED REFRESH ---- 按 s_oled_lines[] 重画整屏 */
+  if (strcmp(tok[1], "REFRESH") == 0)
+  {
+    oled_redraw_lines();
+    (void)snprintf(out, (size_t)out_size, "OK OLED refreshed (4 lines)\r\n");
+    return 1;
+  }
+
+  /* ---- OLED BAR <x> <y> <w> <h> [0|1] ---- 矩形，给"动眼睛"之类打底 */
+  if (strcmp(tok[1], "BAR") == 0)
+  {
+    uint32_t x, y, w, h;
+    OLED_ColorMode color = OLED_COLOR_NORMAL;
+
+    if (ntok < 6UL)
     {
       (void)snprintf(out, (size_t)out_size,
-                     "ERR: flush failed (%d), I2C err=0x%08lX\r\n",
-                     n, (unsigned long)HAL_I2C_GetError(&hi2c2));
+                     "ERR: usage: OLED BAR <x> <y> <w> <h> [0|1]\r\n");
       return -1;
     }
+    if ((parse_dec(tok[2], &x) == 0) || (parse_dec(tok[3], &y) == 0) ||
+        (parse_dec(tok[4], &w) == 0) || (parse_dec(tok[5], &h) == 0))
+    {
+      (void)snprintf(out, (size_t)out_size, "ERR: x/y/w/h must be decimal\r\n");
+      return -1;
+    }
+    if ((ntok >= 7UL) && (tok[6][0] == '0'))
+    {
+      color = OLED_COLOR_REVERSED;
+    }
 
-    (void)snprintf(out, (size_t)out_size, "OK OLED line %u updated\r\n",
-                   (unsigned int)line);
+    OLED_DrawFilledRectangle((uint8_t)x, (uint8_t)y, (uint8_t)w, (uint8_t)h, color);
+    OLED_ShowFrame();
+
+    (void)snprintf(out, (size_t)out_size,
+                   "OK OLED bar (%u,%u) %ux%u %s\r\n",
+                   (unsigned int)x, (unsigned int)y,
+                   (unsigned int)w, (unsigned int)h,
+                   (color == OLED_COLOR_NORMAL) ? "ON" : "OFF");
     return 1;
   }
 
   /* ---- OLED RAW <hex...> ----
    * 直接往 I2C2 上发原始字节，**完全绕开驱动**。
    * 这是留给"以后要让 AI 直接操作 SSD1306 寄存器"的逃生口，
-   * 也是排查"到底是驱动写错了还是屏不认命令"的最后手段。 */
+   * 也是排查"到底是驱动写错了还是屏不认命令"的最后手段。
+   * 注意第一个字节是控制字节（0x00=命令，0x40=数据），要自己带上。 */
   if (strcmp(tok[1], "RAW") == 0)
   {
     uint8_t  raw[64];
@@ -734,7 +826,7 @@ static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
     {
       uint32_t v;
 
-      if (parse_hex(tok[i], &v) == 0 || v > 0xFFUL)
+      if ((parse_hex(tok[i], &v) == 0) || (v > 0xFFUL))
       {
         (void)snprintf(out, (size_t)out_size,
                        "ERR: bad hex byte '%s'\r\n", tok[i]);
@@ -746,12 +838,12 @@ static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
     if (cnt == 0UL)
     {
       (void)snprintf(out, (size_t)out_size,
-                     "ERR: usage: OLED RAW <hex byte> [hex byte ...]\r\n");
+                     "ERR: usage: OLED RAW <ctrl> <hex byte> [hex byte ...]\r\n");
       return -1;
     }
 
-    if (HAL_I2C_Master_Transmit(&hi2c2, SSD1306_I2C_ADDR, raw,
-                                (uint16_t)cnt, SSD1306_I2C_TIMEOUT) != HAL_OK)
+    if (HAL_I2C_Master_Transmit(&hi2c2, OLED_ADDR_8BIT, raw,
+                                (uint16_t)cnt, OLED_XFER_TIMEOUT) != HAL_OK)
     {
       (void)snprintf(out, (size_t)out_size,
                      "ERR: I2C transmit failed, err=0x%08lX\r\n",
@@ -760,12 +852,13 @@ static int cmd_oled(uint32_t ntok, char *tok[], char *out, uint32_t out_size)
     }
 
     (void)snprintf(out, (size_t)out_size, "OK sent %u byte(s) to 0x%02X\r\n",
-                   (unsigned int)cnt, SSD1306_I2C_ADDR);
+                   (unsigned int)cnt, (unsigned int)OLED_ADDR_8BIT);
     return 1;
   }
 
   (void)snprintf(out, (size_t)out_size,
-                 "ERR: unknown OLED subcommand '%s' (try: SCAN CLR FILL TXT PIX RAW)\r\n",
+                 "ERR: unknown OLED subcommand '%s'\r\n"
+                 "     try: INIT ON OFF CLR FILL PIX TXT REFRESH BAR RAW\r\n",
                  tok[1]);
   return -1;
 }

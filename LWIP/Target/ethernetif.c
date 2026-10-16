@@ -143,15 +143,12 @@ static void low_level_init(struct netif *netif)
 
    uint8_t MACAddr[6] ;
   heth.Instance = ETH;
-  /* MAC 地址：使用"本地管理地址"（第一位十六进制的 bit1 = 1，即 02/06/0A/0E...）。
-   * 原来的 00:80:E1:00:00:00 是 ST 官方示例占位值，尾段全零会让某些网卡驱动
-   * 把帧当成异常丢弃，表现出来就是"链路通了但 ping 不通"。 */
-  MACAddr[0] = 0x02;
-  MACAddr[1] = 0x00;
-  MACAddr[2] = 0x00;
-  MACAddr[3] = 0x12;
-  MACAddr[4] = 0x34;
-  MACAddr[5] = 0x56;
+  MACAddr[0] = 0x00;
+  MACAddr[1] = 0x80;
+  MACAddr[2] = 0xE1;
+  MACAddr[3] = 0x00;
+  MACAddr[4] = 0x00;
+  MACAddr[5] = 0x00;
   heth.Init.MACAddr = &MACAddr[0];
   heth.Init.MediaInterface = HAL_ETH_RMII_MODE;
   heth.Init.TxDesc = DMATxDscrTab;
@@ -159,7 +156,16 @@ static void low_level_init(struct netif *netif)
   heth.Init.RxBuffLen = 1536;
 
   /* USER CODE BEGIN MACADDRESS */
-
+  /* MAC 地址：使用"本地管理地址"（第一位十六进制的 bit1 = 1，即 02/06/0A/0E...）。
+   * 上面 CubeMX 生成的 00:80:E1:00:00:00 是 ST 官方示例占位值，尾段全零会让某些
+   * 网卡驱动把帧当成异常丢弃，表现出来就是"链路通了但 ping 不通"。
+   * 这一段放在 USER CODE 区里，CubeMX 重新生成不会覆盖。 */
+  MACAddr[0] = 0x02;
+  MACAddr[1] = 0x00;
+  MACAddr[2] = 0x00;
+  MACAddr[3] = 0x12;
+  MACAddr[4] = 0x34;
+  MACAddr[5] = 0x56;
   /* USER CODE END MACADDRESS */
 
   hal_eth_init_status = HAL_ETH_Init(&heth);
@@ -211,18 +217,6 @@ static void low_level_init(struct netif *netif)
   {
   /* Get link state */
   ethernet_link_check_state(netif);
-
-  /* HAL_ETH_Init() 只做 MAC 软复位 + 配置寄存器 + 搭 DMA 描述符链，它**不**打开
-   * MACCR.TE/RE，也**不**启动 DMAOMR.ST/SR —— 真正置位的是 HAL_ETH_Start()。
-   * 不调用它的现象很有欺骗性：PHY 正常、链路 UP、lwIP 连 ARP 应答都组装好了，
-   * 却丢进一个收发被关掉的 MAC，一个字节都发不出去，PC 报「无法访问目标主机」。
-   * 必须在 HAL_ETH_Init() 之后调用，它会读回当前 MAC 配置再使能收发。 */
-  if (HAL_ETH_Start(&heth) != HAL_OK)
-  {
-    printf("[ETH] ERR: HAL_ETH_Start() failed\r\n");
-    Error_Handler();
-  }
-  printf("[ETH] HAL_ETH_Start() OK -- MAC TE/RE + DMA ST/SR enabled\r\n");
   }
   else
   {
@@ -231,7 +225,22 @@ static void low_level_init(struct netif *netif)
 #endif /* LWIP_ARP || LWIP_ETHERNET */
 
 /* USER CODE BEGIN LOW_LEVEL_INIT */
-
+  /* 【必须调用 HAL_ETH_Start()】
+   * HAL_ETH_Init() 只做 MAC 软复位 + 配置寄存器 + 搭 DMA 描述符链，它**不**打开
+   * MACCR.TE/RE，也**不**启动 DMAOMR.ST/SR —— 真正置位的是 HAL_ETH_Start()。
+   * 不调用它的现象很有欺骗性：PHY 正常、链路 UP、lwIP 连 ARP 应答都组装好了，
+   * 却丢进一个收发被关掉的 MAC，一个字节都发不出去，PC 报「无法访问目标主机」。
+   * 必须在 HAL_ETH_Init() 之后调用，它会读回当前 MAC 配置再使能收发。
+   * 放在 USER CODE 区里，CubeMX 重新生成不会覆盖。 */
+  if (hal_eth_init_status == HAL_OK)
+  {
+    if (HAL_ETH_Start(&heth) != HAL_OK)
+    {
+      printf("[ETH] ERR: HAL_ETH_Start() failed\r\n");
+      Error_Handler();
+    }
+    printf("[ETH] HAL_ETH_Start() OK -- MAC TE/RE + DMA ST/SR enabled\r\n");
+  }
 /* USER CODE END LOW_LEVEL_INIT */
 }
 
@@ -451,97 +460,13 @@ u32_t sys_now(void)
 
 /* USER CODE BEGIN PHI IO Functions for User BSP */
 
-/* USER CODE END PHI IO Functions for User BSP */
-
-/**
-  * @brief  Check the ETH link state then update ETH driver and netif link accordingly.
-  * @retval None
-  *
-  * 【为什么这个函数必须实现】
-  *   MX_LWIP_Process() 每 100ms 调它一次（lwip.c:125），用来把 PHY 的链路状态同步给
-  *   lwIP 的 netif。CubeMX 生成的是空函数，意味着 lwIP 永远不知道网线插没插、
-  *   速率是多少 —— netif 的 link 标志永远不对，ARP/ICMP 全会受影响。
-  *
-  * 【为什么用 USER_PHY_* 而不是 HAL_ETH_ReadPHYRegister】
-  *   .ioc 里 LWIP0.BSP.component = USER_PHY，CubeMX 已经把 ST 的通用 IEEE 802.3
-  *   PHY 驱动（eth_custom_phy_interface.c）编进来了。复用它比自己重写寄存器操作
-  *   更稳，而且它已经处理了自协商过程和 BCR/BSR 的位解析。
-  *
-  * 【PHY 地址固定为 0】
-  *   原理图已确认 YT8512C 的 LED0/PHYADD0(pin24)、LED1/PHYADD1(pin25) 都去驱动 LED，
-  *   没有拉地址，所以地址是 0。这里直接硬编码 0，不走 USER_PHY_Init() 的地址扫描
-  *   —— 那个扫描的判据（regvalue != 0xFFFF）会把 MDIO 悬空读到的 0x7FFF 误判成器件。
-  */
-void ethernet_link_check_state(struct netif *netif)
-{
-  uint32_t bsr = 0;
-  uint32_t bcr = 0;
-  static uint8_t s_last_link = 0xFFU;   /* 0xFF = 还没报过，保证第一次一定打印 */
-
-  /* 【为什么不调用 USER_PHY_GetLinkState()】
-   *
-   * 读过它的实现（eth_custom_phy_interface.c:223-324）后发现一个会直接害死 ping 的缺陷：
-   * 它在自协商完成后读 ANAR/ANLPAR 算 common_adv，如果匹配不上任何一个已知的
-   * "100M-FD / 100M-HD / 10M-FD / 10M-HD"分支，就走到最后的 else，**返回
-   * USER_PHY_STATUS_LINK_DOWN**（第 323 行）。也就是说它把"自协商完成但模式未识别"
-   * 误报成"链路断开"。
-   *
-   * YT8512C 实测 BSR=0x782D（link=1, autoneg_done=1）走的正是这条路，于是 lwIP 被
-   * 告知链路断开 -> netif link_down -> 不发 ARP -> ping 不通。而上一版纯测试固件
-   * 直接读 BSR 位判断，所以一切正常 —— 缺陷只在 lwIP 集成后才暴露。
-   *
-   * 因此这里直接读 BSR 的 bit2 (LINK_STATUS) 判断链路，语义明确、少 6 次 MDIO 读。
-   * 注意 IEEE 802.3 规定 BSR 的 link/autoneg 位是**锁存低**的：读到 0 表示"曾经断过"，
-   * 需要连读两次取第二次的值（第一次读会清掉锁存器）。 */
-  (void)HAL_ETH_ReadPHYRegister(&heth, 0U, 0x01U, &bsr);   /* 第一次：清锁存 */
-  if (HAL_ETH_ReadPHYRegister(&heth, 0U, 0x01U, &bsr) != HAL_OK)   /* 第二次：取真值 */
-  {
-    return;   /* MDIO 读失败，保持当前状态不动，不要误判成 link down */
-  }
-  (void)HAL_ETH_ReadPHYRegister(&heth, 0U, 0x00U, &bcr);
-
-  if ((bsr & 0x0004U) != 0U)   /* BSR bit2 = Link Status */
-  {
-    /* ---- 链路 UP ---- */
-    if (s_last_link != 1U)
-    {
-      /* ⚠ 不要从 BSR 的 bit11~15 反推"协商结果"。那几个位表示的是 PHY 的**能力**
-       * （支持哪些模式），不是本次协商实际选中的模式。BSR=0x782D 的 bit11~14 全 1，
-       * 含义只是"四种模式我都支持"。实际协商结果在厂商专用寄存器里（YT8512C 是
-       * 0x11），BSR 读不出来。
-       * 之前这里把 bit13/bit15 当成 speed/duplex 打印，得出"100M half"的假结论，
-       * 属于解码错误 —— 所以现在只报原始值 + 链路/协商状态位。 */
-      printf("[LINK] UP  BSR=0x%04lX autoneg_done=%lu (cap: 100FD=%lu 100HD=%lu 10FD=%lu 10HD=%lu)\r\n",
-             (unsigned long)bsr,
-             (unsigned long)((bsr >> 5) & 1U),
-             (unsigned long)((bsr >> 14) & 1U),
-             (unsigned long)((bsr >> 13) & 1U),
-             (unsigned long)((bsr >> 12) & 1U),
-             (unsigned long)((bsr >> 11) & 1U));
-      s_last_link = 1U;
-    }
-    netif_set_link_up(netif);
-  }
-  else
-  {
-    /* ---- 链路 DOWN ---- */
-    if (s_last_link != 0U)
-    {
-      printf("[LINK] DOWN  BSR=0x%04lX BCR=0x%04lX\r\n",
-             (unsigned long)bsr, (unsigned long)bcr);
-      s_last_link = 0U;
-    }
-    netif_set_link_down(netif);
-  }
-}
-
 /* ---------------------------------------------------------------------------
  * USER_PHY 驱动需要的三个回调（接到 HAL 的 MDIO 接口上）
- * ------------------------------------------------------------------------- */
-
-/* 注意：USER_PHY_* 的 ReadReg 回调原型是 int32_t (*)(uint32_t, uint32_t, uint32_t*)，
+ *
+ * 注意：USER_PHY_* 的 ReadReg 回调原型是 int32_t (*)(uint32_t, uint32_t, uint32_t*)，
  * 而 HAL_ETH_ReadPHYRegister 要求 uint32_t* 且返回 HAL_StatusTypeDef。
- * 这里做一层薄封装，把 HAL 的错误码翻译成 USER_PHY 约定的 0 / -1。 */
+ * 这里做一层薄封装，把 HAL 的错误码翻译成 USER_PHY 约定的 0 / -1。
+ * ------------------------------------------------------------------------- */
 
 int32_t user_phy_read_reg(uint32_t DevAddr, uint32_t RegAddr, uint32_t *pRegVal)
 {
@@ -564,6 +489,80 @@ int32_t user_phy_write_reg(uint32_t DevAddr, uint32_t RegAddr, uint32_t RegVal)
 int32_t user_phy_get_tick(void)
 {
   return (int32_t)HAL_GetTick();
+}
+
+/* USER CODE END PHI IO Functions for User BSP */
+
+/**
+  * @brief  Check the ETH link state then update ETH driver and netif link accordingly.
+  * @retval None
+  *
+  * 【为什么这个函数必须实现】
+  *   MX_LWIP_Process() 每 100ms 调它一次（lwip.c），用来把 PHY 的链路状态同步给
+  *   lwIP 的 netif。CubeMX 生成的是空函数，意味着 lwIP 永远不知道网线插没插、
+  *   速率是多少 —— netif 的 link 标志永远不对，ARP/ICMP 全会受影响。
+  *
+  * 【为什么不调用 USER_PHY_GetLinkState()】
+  *   读过它的实现（eth_custom_phy_interface.c:323）后发现一个会直接害死 ping 的缺陷：
+  *   它在自协商完成后读 ANAR/ANLPAR 算 common_adv，如果匹配不上任何一个已知的
+  *   "100M-FD / 100M-HD / 10M-FD / 10M-HD"分支，就走到最后的 else，**返回
+  *   USER_PHY_STATUS_LINK_DOWN**。也就是说它把"自协商完成但模式未识别"误报成
+  *   "链路断开"。YT8512C 实测 BSR=0x782D（link=1, autoneg_done=1）走的正是这条路，
+  *   于是 lwIP 被告知链路断开 -> netif link_down -> 不发 ARP -> ping 不通。
+  *
+  * 【PHY 地址固定为 0】
+  *   原理图已确认 YT8512C 的 LED0/PHYADD0(pin24)、LED1/PHYADD1(pin25) 都去驱动 LED，
+  *   没有拉地址，所以地址是 0。这里直接硬编码 0，不走地址扫描 —— 那个扫描的判据
+  *   （regvalue != 0xFFFF）会把 MDIO 悬空读到的 0x7FFF 误判成器件。
+  *
+  * 【BSR 必须连读两次】
+  *   IEEE 802.3 规定 BSR 的 link/autoneg 位是**锁存低**的：读到 0 表示"曾经断过"，
+  *   需要连读两次取第二次的值（第一次读会清掉锁存器）。
+  */
+void ethernet_link_check_state(struct netif *netif)
+{
+  uint32_t bsr = 0;
+  uint32_t bcr = 0;
+  static uint8_t s_last_link = 0xFFU;   /* 0xFF = 还没报过，保证第一次一定打印 */
+
+  (void)HAL_ETH_ReadPHYRegister(&heth, 0U, 0x01U, &bsr);   /* 第一次：清锁存 */
+  if (HAL_ETH_ReadPHYRegister(&heth, 0U, 0x01U, &bsr) != HAL_OK)   /* 第二次：取真值 */
+  {
+    return;   /* MDIO 读失败，保持当前状态不动，不要误判成 link down */
+  }
+  (void)HAL_ETH_ReadPHYRegister(&heth, 0U, 0x00U, &bcr);
+
+  if ((bsr & 0x0004U) != 0U)   /* BSR bit2 = Link Status */
+  {
+    /* ---- 链路 UP ---- */
+    if (s_last_link != 1U)
+    {
+      /* ⚠ 不要从 BSR 的 bit11~15 反推"协商结果"。那几个位表示的是 PHY 的**能力**
+       * （支持哪些模式），不是本次协商实际选中的模式。BSR=0x782D 的 bit11~14 全 1，
+       * 含义只是"四种模式我都支持"。实际协商结果在厂商专用寄存器里（YT8512C 是
+       * 0x11），BSR 读不出来。 */
+      printf("[LINK] UP  BSR=0x%04lX autoneg_done=%lu (cap: 100FD=%lu 100HD=%lu 10FD=%lu 10HD=%lu)\r\n",
+             (unsigned long)bsr,
+             (unsigned long)((bsr >> 5) & 1U),
+             (unsigned long)((bsr >> 14) & 1U),
+             (unsigned long)((bsr >> 13) & 1U),
+             (unsigned long)((bsr >> 12) & 1U),
+             (unsigned long)((bsr >> 11) & 1U));
+      s_last_link = 1U;
+    }
+    netif_set_link_up(netif);
+  }
+  else
+  {
+    /* ---- 链路 DOWN ---- */
+    if (s_last_link != 0U)
+    {
+      printf("[LINK] DOWN  BSR=0x%04lX BCR=0x%04lX\r\n",
+             (unsigned long)bsr, (unsigned long)bcr);
+      s_last_link = 0U;
+    }
+    netif_set_link_down(netif);
+  }
 }
 
 void HAL_ETH_RxAllocateCallback(uint8_t **buff)

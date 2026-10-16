@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "dma.h"
 #include "i2c.h"
 #include "lwip.h"
 #include "usart.h"
@@ -28,7 +29,8 @@
 #include "debug_uart.h"
 #include "eth_phy.h"
 #include "board_io.h"       /* 板级 IO 注册表（DS0/DS1） */
-#include "ssd1306.h"        /* SSD1306 128x64 OLED（I2C2） */
+#include "oled.h"        /* 波特律动 SSD1306 128x64 OLED（I2C2 PH4/PH5） */
+#include "font.h"        /* afont16x8 / font16x16 字库 */
 #include "echo_service.h"   /* 带话术的回声服务（当前启用） */
 #include "udp_echo.h"       /* 原样回环（保留，未启用，端口与上面冲突） */
 /* gnetif 定义在 LWIP/App/lwip.c，但 lwip.h 没有 extern 它，这里自己声明 */
@@ -96,9 +98,9 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART1_UART_Init();
   MX_I2C2_Init();
-
   /* USER CODE BEGIN 2 */
   Debug_UART_Banner("ETHERNETtest boot (step 3: lwip)");
   printf("[OK] printf redirect works\r\n");
@@ -116,11 +118,9 @@ int main(void)
     printf("[ERR] PHY reset release failed -- lwIP would be a zombie, stopping.\r\n");
     while (1) { HAL_Delay(1000); }
   }
-  /* USER CODE END 2 */
 
   MX_LWIP_Init();
 
-  /* USER CODE BEGIN 2b */
   printf("[OK] MX_LWIP_Init() returned\r\n");
   printf("[IP ] board = %u.%u.%u.%u  mask = %u.%u.%u.%u  gw = %u.%u.%u.%u\r\n",
          ip4_addr1(&gnetif.ip_addr), ip4_addr2(&gnetif.ip_addr),
@@ -147,7 +147,7 @@ int main(void)
     printf("[ERR] Echo_Service_Init() failed -- echo service unavailable\r\n");
   }
 
-  /* SSD1306 OLED（I2C2，和 PCF8574 共用总线）。
+  /* SSD1306 OLED（I2C2，和 PCF8574 共用总线）—— 用波特律动驱动 oled.c。
    *
    * 【为什么放在 ETH_PHY_ReleaseReset() 之后】
    * 同一根 I2C2 上挂着 PCF8574（管 ETH_RESET）。OLED 插上后总线负载变大，
@@ -155,24 +155,34 @@ int main(void)
    * 而那个函数失败是 while(1) 直接停 —— 板子永远起不来。
    * 放在后面，最坏情况也只是屏不亮，网络照常。
    *
-   * 【失败不阻塞】屏是可选外设，初始化失败只打印日志，主循环继续跑。 */
-  if (SSD1306_Init() != 0)
+   * 【为什么不检查返回值】波特律动的 OLED_Init() 返回 void，它内部
+   * OLED_Send() 把 HAL 错误全吞了。所以这里没法判断成功与否，只能画完
+   * 让用户看屏。屏不亮就发 'OLED INIT' 手动重试。
+   *
+   * 【上电时序】模块上的复位电容要充电，STM32 启动比 OLED 上电快，
+   * 所以这里等 100ms 再初始化（oled.c 原注释也提示要等 20ms 以上）。 */
+  HAL_Delay(100);
+
+  OLED_Init();
+  OLED_NewFrame();
+
+  /* 波特律动的打印函数形参是 char*（非 const），字面量要转一下。
+   * 这是 main() 的栈帧，只在这几行用，转成可写指针是安全的。 */
   {
-    printf("[OLED] init failed -- continuing without display "
-           "(try: send 'OLED SCAN' over UDP)\r\n");
+    static char l0[] = "ETHERNETtest";
+    static char l1[] = "192.168.1.30";
+    static char l2[] = "UDP :8080";
+    static char l3[] = "type HELP";
+
+    OLED_PrintASCIIString(0U,  0U, l0, &afont16x8, OLED_COLOR_NORMAL);
+    OLED_PrintASCIIString(0U, 16U, l1, &afont16x8, OLED_COLOR_NORMAL);
+    OLED_PrintASCIIString(0U, 32U, l2, &afont16x8, OLED_COLOR_NORMAL);
+    OLED_PrintASCIIString(0U, 48U, l3, &afont16x8, OLED_COLOR_NORMAL);
   }
-  else
-  {
-    SSD1306_DrawString(0U,  0U, "ETHERNETtest", 1U);
-    SSD1306_DrawString(0U, 16U, "192.168.1.30", 1U);
-    SSD1306_DrawString(0U, 32U, "UDP :8080", 1U);
-    SSD1306_DrawString(0U, 48U, "type HELP", 1U);
-    if (SSD1306_Flush() != 0)
-    {
-      printf("[OLED] boot screen flush failed\r\n");
-    }
-  }
-  /* USER CODE END 2b */
+
+  OLED_ShowFrame();
+  printf("[OLED] boot screen drawn (BaudDance driver, I2C2 PH4/PH5)\r\n");
+  /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */

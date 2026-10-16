@@ -1,7 +1,7 @@
 # AGENTS.md — ETHERNETtest 工程工作手册
 
 > **本文件给未来的 AI 助手（和我自己）看。每次改动代码后必须更新本文件。**
-> 最后更新：2026-02-13 | 当前提交：`872e524`（本次提交写入时尚未生成哈希）
+> 最后更新：2026-02-13 | 上一次提交：`bef83dd`（本次提交写入时尚未生成哈希）
 
 ---
 
@@ -105,7 +105,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/eth_phy.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/board_io.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/reg_shell.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/ssd1306.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/oled.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/font.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/echo_service.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/udp_echo.c
 )
@@ -130,14 +131,16 @@ ETHERNETtest/
 │   │   ├── debug_uart.h       printf 重定向接口
 │   │   ├── board_io.h         板级 IO 注册表接口（DS0/DS1）
 │   │   ├── reg_shell.h        ★ 以太网命令接口（LED / R / W / OLED）
-│   │   ├── ssd1306.h          ★ SSD1306 128x64 OLED 驱动接口
+│   │   ├── oled.h             ★ 波特律动 SSD1306 驱动接口（第三方）
+│   │   ├── font.h             ★ 字库接口：afont16x8 / font16x16（第三方）
 │   │   ├── echo_service.h     带话术的回声服务接口（**当前启用**）
 │   │   ├── udp_echo.h         UDP 原样回环接口（保留，未启用）
 │   │   ├── main.h / i2c.h / usart.h / gpio.h / stm32f4xx_it.h / stm32f4xx_hal_conf.h
 │   └── Src/
 │       ├── eth_phy.c          ★ 板级补丁（MspInit + PHY 复位 + PHY 准备 + 诊断）
 │       ├── board_io.c         ★ 板级 IO 注册表（扩展点：加一行就多一个可控 IO）
-│       ├── ssd1306.c          ★ OLED 驱动（帧缓冲 + 脏页刷新 + 8x16 ASCII 字库）
+│       ├── oled.c             ★ 波特律动 SSD1306 驱动（第三方，用 I2C2）
+│       ├── font.c             ★ 波特律动字库：ASCII 8x6/12x6/16x8/24x12 + 中文 16x16
 │       ├── reg_shell.c        ★ 命令解析 + 寄存器读写地址白名单 + OLED 命令
 │       ├── echo_service.c     ★ 带话术的 UDP 回声 + 命令分发（当前启用的应用）
 │       ├── udp_echo.c         UDP 原样回环（保留，未启用，端口与上面冲突）
@@ -166,6 +169,8 @@ ETHERNETtest/
 | `Core/Src/main.c` | 初始化顺序（**不能改**） | 见 3.3 |
 | `Core/Src/board_io.c` | 板级 IO 注册表（DS0/DS1） | **扩展点**，见 3.6 |
 | `Core/Src/reg_shell.c` | 命令解析 + 寄存器读写白名单 | 见 3.7 |
+| `Core/Src/oled.c` | 波特律动 SSD1306 驱动（第三方） | 用 `hi2c2`，见 3.9 |
+| `Core/Src/font.c` | 波特律动字库（ASCII + 中文 16x16） | 第三方，见 3.9 |
 | `Core/Src/echo_service.c` | **当前启用的应用**：UDP 8080 回声 + 心跳 + 命令分发 | 见 3.5 |
 | `Core/Src/udp_echo.c` | UDP 8080 原样回环 + 每秒心跳 | **未启用**，端口与上面冲突 |
 | `LWIP/App/lwip.c` | `gnetif` 定义（`:45`）、IP 配置（`:63-66`） | |
@@ -360,6 +365,14 @@ typedef struct {
 | | `LED DS0 TOGGLE` | 翻转 DS0 |
 | `R` | `R <addr> <count>` | 读寄存器，addr/count 都是**十六进制**，count 上限 16 |
 | `W` | `W <addr> <value>` | 写 32 位寄存器，addr/value 都是**十六进制** |
+| `RB`/`WB` | `RB <addr>` / `WB <addr> <value>` | 8 位读写（`tok[0][1]=='B'` 判据） |
+| `OLED` | `OLED` | 把帧缓冲渲染成 4×16 格 `#`/`.` ASCII 示意发回来（**不反查字库**） |
+| | `OLED SCAN` | 扫 I2C2 总线，列所有应答的 7 位地址（OLED 应为 `0x3C`） |
+| | `OLED CLR` / `OLED FILL` | 清屏 / 全亮 |
+| | `OLED TXT <行 0..3> <文本...>` | 在指定行写字（先擦该行再画，见 §3.9 的字库分派） |
+| | `OLED PIX <x> <y> [0\|1]` | 画/擦一个像素 |
+| | `OLED RD <寄存器>` | **直接读 SSD1306 寄存器**（波特律动 `OLED_ReadCmd`），排障用 |
+| | `OLED RAW <hex...>` | 把原始字节直发 `0x78`，**完全绕开驱动**的逃生口 |
 | `BROADCAST` | `BROADCAST [port]` | 大帧回包另发一份到这个端口（`0` = 关） |
 | `PING` | `PING` | 回 `PONG tick=...`，最便宜的"活着吗"探测 |
 
@@ -419,6 +432,52 @@ typedef struct {
 
 > **触发心跳的行为不变**：任何来包都会更新"最近一次来包的 PC"，所以命令
 > 发过一次之后，心跳仍会每秒推给那台 PC。
+
+### 3.9 `oled.c` / `font.c` —— OLED 驱动（波特律动，第三方）
+
+**驱动来源**：波特律动（BaudDance）`oled.c` / `oled.h` / `font.c` / `font.h`，
+用户提供的第三方代码，**不是自己写的**。此前自己写过一版 `ssd1306.c`，
+已废弃删除（见 §10 变更日志）。
+
+**接线**：SSD1306 128×64 挂在**已有的 I2C2**（`PH4`=SCL / `PH5`=SDA），
+7 位地址 `0x3C`（写到驱动的 8 位形式是 `0x78`）。I2C2 上同时挂着 PCF8574
+（`0x20`，管 ETH_RESET）—— **地址不冲突可共存**，但两个上拉并联会让等效
+阻值偏低。
+
+**接口**（`Core/Inc/oled.h`，第三方原本的 API）：
+
+| 函数 | 职责 |
+|---|---|
+| `OLED_Init(void)` | 初始化序列（含电荷泵），失败返回非 0 |
+| `OLED_Clear(void)` | 清屏 |
+| `OLED_ShowChar(x, y, ch, size, mode)` | 显示一个 ASCII 字符（size 可选 12/16/24） |
+| `OLED_ShowString(x, y, str, size)` | 显示字符串 |
+| `OLED_ShowChinese(x, y, idx)` | 显示 `font16x16` 里的第 idx 个汉字 |
+| `OLED_ShowFloat` / `OLED_ShowInt` | 数字显示 |
+| `OLED_DrawPoint` / `OLED_DrawLine` / `OLED_DrawCircle` | 图形 |
+| `OLED_WriteCmd(cmd)` / `OLED_ReadCmd(cmd)` | **直接读写 SSD1306 寄存器**（`OLED RD` 命令用它） |
+
+**字库分派（重要坑）**：`font.c` 里有两套中文字库 ——
+`afont16x8[]`（ASCII，8×16，**由 `font16x8.h` 提供**）与 `font16x16[]`
+（中文 16×16）。`OLED_ShowChinese()` 用的是 `font16x16`；
+ASCII 字符走 `OLED_ShowChar()` 的 `font->ascii`。
+
+> ⚠ `OLED_ShowChinese()` 的 `idx` 是**数组下标**，不是汉字码。要显示某个汉字
+> 必须先在 `afont16x8`/`font16x16` 里找到它的位置。当前 `OLED TXT` 命令
+> **只走 ASCII 路径**（`font->ascii` 显示，不认得的字画空格），中文显示留到
+> 第 3 步的 `OLED BLIT` 由 PC 下发点阵。
+
+**与 CubeMX 的关系**：驱动用的是全局 `hi2c2`（`Core/Src/i2c.c` 里定义），
+所以 `MX_I2C2_Init()` 必须已经跑过 —— `main.c` 里 `SSD1306_Init()` 的调用点
+在 `ETH_PHY_ReleaseReset()` **之后**，理由见 §3.3。
+
+> ⚠ **OLED 初始化放在 PHY 复位之后，是为了隔离风险**：OLED 若把 I2C2 总线
+> 拉死，`ETH_PHY_ReleaseReset()` 会失败并让 `main()` 停在 `while(1) HAL_Delay(1000)`，
+> 板子永远起不来。放后面最坏只是屏不亮，网络不受影响。
+
+> **`OLED RD` 是本工程的排障关键**：I2C 写成功但屏不亮时，读写一个已知
+> 寄存器的值能区分"总线通但驱动没配对"和"总线根本没通"。当初就是靠
+> `OLED RD 1` 才确认 0x3C 是**真的有器件在应答**（见 §8 排查表）。
 
 ---
 
@@ -487,6 +546,11 @@ RMII     : PA1 REF_CLK, PA2 MDIO, PA7 CRS_DV, PC1 MDC,
 | **大帧同时发两路（`ReplyBoth`），不切片** | 一条 UDP 最大 1472 字节，1472 字节在 100M 链路上只要约 0.1ms。**切片没有收益**，真正的瓶颈是 I2C（1024 字节 @100kHz ≈ 100ms） |
 | **`send_raw()` 不做任何拷贝** | 960 字节的帧拷一遍就要 `PBUF_POOL_SIZE × PBUF_POOL_BUFSIZE` = 4×1524 = 6096 字节的池里再占一块，多一次 `memcpy` 没有意义 |
 | **`BROADCAST` 只改"第二路目标"，不动 peer** | 保持心跳和普通回包仍指向"最后来包的 PC"，不因为设了广播就改变主链路 |
+| **OLED 用第三方波特律动驱动，不自写** | 自写 `ssd1306.c` 一版能编译、I2C 也通，但屏不亮，反复排查成本高于换驱动。第三方驱动带完整初始化和 `OLED_ReadCmd` 回读能力 |
+| **`ssd1306.c` 废弃删除，不保留** | 两套驱动都定义 `0x3C` 的读写路径，同时存在会重复占用 I2C2 且符号冲突；波特律动那套已被 `OLED RD 1` 实测验证能点亮，保留旧的没有收益 |
+| **OLED 初始化放在 `ETH_PHY_ReleaseReset()` 之后** | OLED 把 I2C2 拉死时，PHY 复位会失败 → `main()` 停在 `while(1) HAL_Delay(1000)`，板子彻底起不来。放后面最坏只是屏不亮 |
+| **`OLED TXT` 只走 ASCII 路径** | 波特律动的 `OLED_ShowChinese()` 用数组下标而非汉字码，命令层无从表达；中文留给第 3 步 `OLED BLIT` 由 PC 下发点阵，更通用 |
+| **保留 `OLED RAW` 逃生口** | 驱动封装再全也可能漏掉某个寄存器；`RAW` 直发原始字节给 `0x78`，是排障和试探的最后一招 |
 
 ### 5.1 MDIO 地址扫描的假阳性（重要）
 
@@ -571,7 +635,26 @@ ping 192.168.1.30
 > ⚠ **`ECHO ` 前缀不能省**（见 §3.8）。不带前缀的普通文本现在会被当命令，
 > 得到 `[ERR] unknown command`。这是改用命令接口后的**行为变更**。
 
-### 7.5 命令接口实测（当前主功能）
+### 7.5 OLED 实测
+
+| 发这条 | 期望 | 现象 |
+|---|---|---|
+| （上电即测） | 串口打印 `[OLED] boot screen drawn (BaudDance driver, I2C2 PH4/PH5)` | **屏上出现 4 行字**：`ETHERNETtest` / `192.168.1.30` / `UDP :8080` / `type HELP` |
+| `OLED INIT` | `OK OLED re-init` | 屏重新初始化（屏全黑时第一招） |
+| `OLED TXT 0 HELLO` | `OK` | 第 1 行变成 `HELLO` |
+| `OLED PIX 64 32 1` | `OK` | 屏幕正中央一个亮点 |
+| `OLED BAR 0 0 64 16 1` | `OK` | 左上角一个 64×16 实心块 |
+| `OLED` | ASCII 屏幕示意（`#`/`.`） | 能远程「看到」屏上内容 |
+| `OLED CLR` / `OLED FILL` | `OK` | 清屏 / 全亮 |
+| `OLED OFF` / `OLED ON` | `OK` | 屏灭 / 屏亮（**不丢显存**） |
+| `OLED RAW 00 AF` | `OK` | 直发原始字节（绕开驱动，最后逃生口） |
+
+> **OLED 全黑时的排查顺序**：① 发 `OLED INIT`（上电时序错了就这一招救回）；
+> ② 发 `OLED RAW 00 AF` 看有没有 `OK`（判 I2C2 握手）；③ 摸模块 VCC 的 3.3V；
+> ④ 换 `0x3D` 地址的屏试。波特律动驱动**吞掉 HAL 错误**（`OLED_Send()` 返回 void），
+> 所以串口不报错**不代表**写入成功。
+
+### 7.6 命令接口实测（当前主功能）
 
 配置同上，发 **文本命令**，逐条核对：
 
@@ -622,6 +705,10 @@ ping 192.168.1.30
 | **命令回了 `not in the allow-list`** | 地址不在白名单 | 只有 GPIOA~K 和 RCC 允许；加外设要改 §3.7 的白名单表 |
 | **`W 40023800 ...` 被拒** | RCC 是只读项 | **这是设计如此**，写 RCC 会掉时钟/变砖 |
 | **串口没有 `[CMD]` 日志** | `echo_service.c` 分发没接上 | 检查回调里的前缀判断（见 §3.8） |
+| **OLED 全黑，串口却无任何报错** | 波特律动驱动吞掉 HAL 错误 | `OLED_Send()` 返回 void。先发 `OLED INIT`，再发 `OLED RAW 00 AF` 判握手（见 §7.5） |
+| **`OLED SCAN` 报 `not found` 但屏其实能点亮** | 扫描用 `HAL_I2C_IsDeviceReady` 探测，**该函数不可靠** | 别信扫描结果，直接发 `OLED TXT 0 TEST` 看屏。实测扫描曾漏报 0x3C 而屏是可点亮的 |
+| **串口日志停在 `[PCF] eth_reset released` 就没了** | CubeMX 重新生成把 `USER CODE` 区外的代码删了 | `git diff` 看 `main.c`；手写代码必须放进 `USER CODE BEGIN/END` 配对里（见 §3.4 注） |
+| **CubeMX 重新生成后网口又不通** | `ethernetif.c` 的 5 处手工改动被还原 | 按 §3.4 逐条重做；MAC 变回 `00:80:E1:00:00:00` 或丢了 `HAL_ETH_Start()` 都是它 |
 
 ---
 
@@ -678,6 +765,55 @@ clangd `.cache/`、`__pycache__/`、OS 垃圾文件。
 ## 10. 变更日志
 
 > **每次改动代码后在此追加一条，最新的在最上面。**
+
+### 2026-02-13 — 切换到波特律动 OLED 驱动（本提交）
+
+**背景**：自写的 `ssd1306.c` 能编译、I2C 扫描也能扫到 `0x3C`，但屏始终不亮，
+串口报 `[OLED] FAIL: no ACK from 0x78`。换用用户提供的第三方波特律动驱动后，
+`OLED RD 1` 一次点亮 —— **根因是自写驱动的探测逻辑过于激进**：它在初始化最前面
+先发一条 `0xAE` 探测，一次短传输没成功就 `return -1` 放弃整条初始化路径
+（`Core/Src/ssd1306.c:95`）。**探测失败不代表设备不在，只代表这一次传输没成功。**
+
+**新增（用户提供的第三方代码，本工程只做了 I2C 端口移植）**：
+
+- `Core/Inc/oled.h` + `Core/Src/oled.c` —— 波特律动 SSD1306 驱动（MIT，2023-08）。
+  唯一的本工程改动：`extern I2C_HandleTypeDef hi2c1;` → **`hi2c2`**，
+  调用处 `HAL_I2C_Master_Transmit(&hi2c1, ...)` → `&hi2c2`（本工程 OLED 挂 I2C2，
+  且没有 I2C1，不改会 undefined reference）。原注释里驱动作者自己也提示了这一点。
+- `Core/Inc/font.h` + `Core/Src/font.c` —— 波特律动字库。ASCII 四档
+  （`afont8x6`/`afont12x6`/`afont16x8`/`afont24x12`）+ 中文 `font16x16`
+  （**只有 4 个字：「波特律动」**）+ `bilibiliImg`。
+
+**删除**：`Core/Inc/ssd1306.h` + `Core/Src/ssd1306.c`（自写驱动，见 §5 决策表）。
+`CMakeLists.txt` 的 `target_sources()` 里对应换成 `oled.c` / `font.c`。
+
+**改动 `Core/Src/reg_shell.c`（OLED 命令整块重写）**：
+
+- 由于几何宏（`OLED_COLUMN`/`OLED_PAGE`/`OLED_ADDRESS`）都定义在 `oled.c`
+  **内部**而不在头文件里，本文件**自写一份常量**（`OLED_COLS_V 128`、`OLED_PAGES_V 8`、
+  `OLED_ADDR_8BIT 0x78` 等）并 `extern uint8_t OLED_GRAM[8][128];`。
+  这样做的好处是：日后升级第三方驱动不会因为宏改名而破坏本文件。
+- 新增 `static char s_oled_lines[4][64]` 四行文本影子 + `oled_redraw_lines()`。
+  **必须这样的原因**：波特律动是全屏重绘模型，`OLED_NewFrame()` 会 `memset`
+  整个显存，只画一行会把其它三行抹掉。
+- 子命令改为 `INIT` / `ON` / `OFF` / `CLR` / `FILL` / `TXT <行> <文本>` /
+  `REFRESH` / `PIX <x> <y> [0|1]` / `BAR <x> <y> <w> <h> [0|1]` / `RAW <ctrl> <hex...>`。
+- `OLED` / `OLED SHOW` 的 ASCII 示意判据**反了**：波特律动 `OLED_SetPixel()` 里
+  **bit=1 表示灭、bit=0 表示亮**（`OLED_NewFrame()` 是 `memset(0)` = 全亮），
+  所以 `(masked) == 0U` 才算亮点。
+
+**改动 `Core/Src/main.c`（开机屏显）**：
+
+- `HAL_Delay(100)` 等模块上电稳定（`oled.c` 原注释提示 STM32 启动比 OLED 快），
+  然后 `OLED_Init()` → `OLED_NewFrame()` → 4 行 `OLED_PrintASCIIString()` →
+  `OLED_ShowFrame()`，串口打 `[OLED] boot screen drawn (BaudDance driver, I2C2 PH4/PH5)`。
+- **不检查返回值**：波特律动的 `OLED_Init()` 返回 void，`OLED_Send()` 把 HAL 错误
+  静默吞掉。屏不亮就发 `OLED INIT` 重试。
+- 调用点仍在 `ETH_PHY_ReleaseReset()` **之后**（理由见 §5 决策表）。
+
+**实测结论**：`OLED RD 1` 后屏幕点亮，中文回显与命令通道均正常。
+
+同步更新 AGENTS.md §2.4 / §3 结构树 / §3.1 / §3.9 / §5 / §7.5 / §8 / §10。
 
 ### 2026-02-13 — 分层发送层 + `BROADCAST` / `PING` 命令
 
@@ -844,6 +980,8 @@ GPIOA~GPIOK（`0x40020000`~`0x40023FFF`）与 RCC（`0x40023800`~`0x40023BFF`，
 
 | 项 | 说明 | 优先级 |
 |---|---|---|
+| **OLED 第 2 步：刷屏走中断/DMA** | 当前 `OLED_ShowFrame()` 是阻塞全屏刷 8 页，1024 字节 @100kHz ≈ 92ms，期间 `MX_LWIP_Process()` 完全停摆。`Core/Src/dma.c` + `Core/Inc/dma.h` 已由 CubeMX 生成（`hdma_i2c2_rx`=DMA1_Stream2、`hdma_i2c2_tx`=DMA1_Stream7，均 Channel 7，**与 ETH 不冲突**），但**尚未接入** | **高** |
+| **OLED 第 3 步：`OLED BLIT` + 动眼睛动画** | 用户目标（原话）：「在 OLED 上显示一双会动的眼睛，AI 可以通过修改寄存器等操作直接控制」。**帧缓冲上传（约 1032 字节/帧）才是可行形态，不是逐寄存器写** —— 15~30 fps × 1024 字节用 `W` 一条 4 字节要几十万条命令/秒，物理上做不到。发送侧 `Echo_Service_ReplyBoth()` 已就绪 | **高** |
 | `.mxproject` 追踪 | 见 9.3，尚未决定是否移除追踪 | 低 |
 | 改用 HSE 25MHz | 当前用 HSI ±1%，UART 波特率有偏差；RMII 参考时钟由 PHY 自己的晶振提供，不影响以太网。属可选优化 | 低 |
 | TCP 应用 | `LWIP_TCP=1` 但工程未写 TCP 应用 | — |

@@ -77,6 +77,8 @@ int Echo_Service_ReplyRaw(const void *data, size_t len);
 /**
   * @brief  大帧回包：同时发给"命令来源"和 BROADCAST 订阅端口
   * @note   给 OLED 全屏位图这类 1KB 级数据用，见 .c 里的说明。
+  *         **不受 ECHO_TX_BUF_SIZE（512）限制** —— 直接走 send_raw()，
+  *         上限是单个 UDP 报文（65535 字节，实际还受 PBUF_POOL 约束）。
   */
 int Echo_Service_ReplyBoth(const void *data, size_t len);
 

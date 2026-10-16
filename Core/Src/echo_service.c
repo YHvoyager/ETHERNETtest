@@ -185,7 +185,7 @@ static void sanitize_inplace(char *s, size_t len)
   * @note   所有对外回包函数最终都汇到这里。len 的上限是 u16_t（65535），
   *         但实际能发多少取决于 PBUF_POOL 的配置 —— 超了会返回 -1 并打警告。
   */
-static int send_raw(const void *data, size_t len, const ip_addr_t *ip, u16_t port)
+static int send_raw(const ip_addr_t *ip, u16_t port, const void *data, size_t len)
 {
   struct pbuf *p;
   err_t err;
@@ -223,26 +223,30 @@ static int send_raw(const void *data, size_t len, const ip_addr_t *ip, u16_t por
 }
 
 /**
-  * @brief  把一个数据块发到**任意** ip:port（不依赖"最后来包的 peer"）
-  * @retval 0 = 成功，-1 = 失败
+  * @brief  把一条消息发给**最后来包的那台 PC**（普通回包路径）
+  * @retval 0 = 成功，-1 = 组包或发送失败
   *
-  * @note   上限是 ECHO_TX_BUF_SIZE（512），因为中转用的是 static 缓冲；
-  *         要发更大的东西用下面的 send_to_addr()。
+  * @note   与 send_raw() 的区别：目标不是参数，而是记在 s_peer_ip/s_peer_port
+  *         里的"最后来包的 PC"。命令处理函数用它，这样命令实现本身不需要知道
+  *         "谁是 peer"。
+  *
+  *         ⚠ 上限是 ECHO_TX_BUF_SIZE（512）—— 超过就截断。要发大帧必须走
+  *         send_raw()（见 Echo_Service_ReplyBoth）。
   */
-static int send_to_addr(const ip_addr_t *ip, u16_t port, const void *msg, size_t len)
+static int send_to_peer(const char *msg, size_t len)
 {
-  if ((ip == NULL) || (msg == NULL) || (len == 0U))
+  if (s_pcb == NULL || s_have_peer == 0U || len == 0U)
   {
     return -1;
   }
 
+  /* 截断保护：一条 UDP 报文超过底层能承载的长度会直接发失败 */
   if (len > (size_t)ECHO_TX_BUF_SIZE)
   {
-    return -1;
+    len = (size_t)ECHO_TX_BUF_SIZE;
   }
 
-  memcpy(s_tx_buf, msg, len);
-  return send_raw(s_tx_buf, len, ip, port);
+  return send_raw(&s_peer_ip, s_peer_port, msg, len);
 }
 
 /**
@@ -289,20 +293,22 @@ int Echo_Service_ReplyBoth(const void *data, size_t len)
 {
   int rc = -1;
 
-  if ((data == NULL) || (len == 0U) || (len > (size_t)ECHO_TX_BUF_SIZE))
+  /* 上限是单个 UDP 报文能装下的字节数（u16_t），不是 ECHO_TX_BUF_SIZE ——
+   * 这正是本函数存在的理由：1032 字节的 OLED 位图必须能原样发出去，
+   * 不能走 512 字节的 s_tx_buf。 */
+  if ((data == NULL) || (len == 0U) || (len > 0xFFFFU))
   {
     return -1;
   }
 
   if (s_have_peer != 0U)
   {
-    memcpy(s_tx_buf, data, len);
-    rc = send_to_peer(s_tx_buf, len);
+    rc = send_raw(&s_peer_ip, s_peer_port, data, len);
   }
 
   if (s_bcast_enabled != 0U)
   {
-    (void)send_raw(data, len, &s_bcast_ip, s_bcast_port);
+    (void)send_raw(&s_bcast_ip, s_bcast_port, data, len);
   }
 
   return rc;
@@ -334,58 +340,12 @@ int Echo_Service_ReplyChunked(const uint8_t *data, size_t len, uint16_t mtu)
       chunk = (size_t)mtu;
     }
 
-    if (send_raw(&data[off], chunk, &s_peer_ip, s_peer_port) != 0)
+    if (send_raw(&s_peer_ip, s_peer_port, &data[off], chunk) != 0)
     {
       return -1;
     }
 
     off += chunk;
-  }
-
-  return 0;
-}
-
-/**
-  * @brief  把一条消息发到指定 peer
-  * @retval 0 = 成功，-1 = 组包或发送失败
-  */
-static int send_to_peer(const char *msg, size_t len)
-{
-  struct pbuf *p;
-  err_t err;
-
-  if (s_pcb == NULL || s_have_peer == 0U || len == 0U)
-  {
-    return -1;
-  }
-
-  /* 截断保护：一条 UDP 报文超过底层能承载的长度会直接发失败 */
-  if (len > (size_t)ECHO_TX_BUF_SIZE)
-  {
-    len = (size_t)ECHO_TX_BUF_SIZE;
-  }
-
-  p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)len, PBUF_POOL);
-  if (p == NULL)
-  {
-    printf("[ECHO] WARN: pbuf_alloc(%u) failed\r\n", (unsigned int)len);
-    return -1;
-  }
-
-  if (pbuf_take(p, msg, (u16_t)len) != ERR_OK)
-  {
-    printf("[ECHO] WARN: pbuf_take failed\r\n");
-    pbuf_free(p);
-    return -1;
-  }
-
-  err = udp_sendto(s_pcb, p, &s_peer_ip, s_peer_port);
-  pbuf_free(p);   /* 本工程用拷贝语义，交给下层之后这里可以释放 */
-
-  if (err != ERR_OK)
-  {
-    printf("[ECHO] WARN: udp_sendto failed (err=%d)\r\n", (int)err);
-    return -1;
   }
 
   return 0;

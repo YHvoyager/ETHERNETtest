@@ -1,3 +1,147 @@
-build
-mx.scratch
-!.settings
+# ============================================================
+# STM32CubeMX / CMake / ARM GCC  --  忽略编译与 IDE 生成文件
+# ============================================================
+
+# ---------- 构建输出目录 ----------
+build/
+build*/
+cmake-build-*/
+out/
+bin/
+obj/
+Debug/
+Release/
+
+# 注意：git 的 build/ 规则会匹配任意层级的 build 目录
+# 但 cmake/stm32cubemx/CMakeLists.txt 等源文件不受影响
+
+# ---------- CMake 生成物 ----------
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+*.cmake.stamp
+CMakeConfigureLog.yaml
+TargetDirectories.txt
+rules.ninja
+build.ninja
+.ninja_deps
+.ninja_log
+Makefile
+!/cmake/*.cmake
+!/*/CMakeLists.txt
+
+# ---------- 编译产物 / 链接输出 ----------
+*.o
+*.obj
+*.d
+*.su
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.lst
+*.axf
+*.srec
+*.ihex
+*.sym
+*.lss
+*.gcno
+*.gcda
+*.gcov
+*.a
+*.la
+*.lo
+*.out
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 预编译/临时中间文件
+*.i
+*.ii
+*.s.tmp
+
+# ---------- CubeMX / STM32CubeIDE ----------
+*.mx.scratch
+mx.scratch/
+.mxproject.bak
+*.ioc.bak
+Backup*/
+.cproject
+.project
+.cproject.bak
+.settings.bak
+*.launch
+*.tmr
+.metadata/
+RemoteSystemsTempFiles/
+.settings/**/*.bak
+
+# ---------- 编辑器 / IDE ----------
+.vscode/*.log
+.vscode/ipch/
+.vscode/.browse*
+.vscode/compile_commands.json
+.vscode/tasks.json.bak
+
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+*.bak
+*.tmp
+*.temp
+
+# ---------- clangd / 语言服务器缓存 ----------
+.cache/
+.clangd/
+!.clangd
+.cache/clangd/
+
+# ---------- 调试 / 烧录器输出 ----------
+*.svd.bak
+openocd.log
+*.trace
+*.svd
+*.log
+
+# ---------- 操作系统垃圾文件 ----------
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ---------- Python / 脚本工具 ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ============================================================
+# 强制保留（即使被上面的规则匹配，也要纳入版本控制）
+# ============================================================
+!.settings/
+!.settings/*.json
+!.vscode/
+!.vscode/settings.json
+!.vscode/c_cpp_properties.json
+!CMakePresets.json
+!CMakeLists.txt
+!cmake/*.cmake
+!cmake/stm32cubemx/CMakeLists.txt
+!*.ioc
+!*.ld
+!*.s

@@ -134,7 +134,28 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
 
     __HAL_LINKDMA(i2cHandle,hdmatx,hdma_i2c2_tx);
 
+    /* I2C2 interrupt Init */
+    HAL_NVIC_SetPriority(I2C2_EV_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(I2C2_EV_IRQn);
   /* USER CODE BEGIN I2C2_MspInit 1 */
+
+    /* 【本工程新增】补上 I2C2 的错误中断（ER）。
+     *
+     * 【为什么 CubeMX 没生成】.ioc 的 NVIC 页里只勾了 "I2C2 event interrupt"，
+     * 没勾 "I2C2 error interrupt"，所以上面那两行只有 EV 没有 ER。
+     *
+     * 【为什么必须要有】EV 中断里的 TC（Transfer Complete）负责把 hi2c2.State
+     * 从 BUSY_TX 放回 READY；而一旦总线出问题（NACK、仲裁丢失、BERR、总线超时），
+     * 是 ER 中断负责把状态机踢回 READY 并置 HAL_I2C_ERROR_xxx。少了它，
+     * 一次总线错误就会让 hi2c2.State 永久卡在 BUSY —— 之后连 PCF8574 的
+     * ETH_RESET 都写不进去，PHY 复位失败，main() 停在 while(1) 起不来。
+     *
+     * 【位置】放在 USER CODE 区里，CubeMX 重新生成不会删。
+     * 想彻底一劳永逸：在 CubeMX 的 NVIC 页把 I2C2 error interrupt 也勾上，
+     * 那这两行就可以删掉（勾了之后 CubeMX 会自己生成）。
+     */
+    HAL_NVIC_SetPriority(I2C2_ER_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(I2C2_ER_IRQn);
 
   /* USER CODE END I2C2_MspInit 1 */
   }
@@ -162,6 +183,9 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef* i2cHandle)
     /* I2C2 DMA DeInit */
     HAL_DMA_DeInit(i2cHandle->hdmarx);
     HAL_DMA_DeInit(i2cHandle->hdmatx);
+
+    /* I2C2 interrupt Deinit */
+    HAL_NVIC_DisableIRQ(I2C2_EV_IRQn);
   /* USER CODE BEGIN I2C2_MspDeInit 1 */
 
   /* USER CODE END I2C2_MspDeInit 1 */

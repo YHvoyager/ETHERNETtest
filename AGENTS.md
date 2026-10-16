@@ -898,6 +898,78 @@ clangd `.cache/`、`__pycache__/`、OS 垃圾文件。
 
 > **每次改动代码后在此追加一条，最新的在最上面。**
 
+### 2026-02-13 — 勾上 I2C2 NVIC 后修复重复定义 + 二次覆盖
+
+**背景**：用户在 CubeMX 的 NVIC 页勾上了 I2C2 的中断并重新生成，导致又一次覆盖。
+这次的**现象和上次不同**，暴露了一个更隐蔽的坑。
+
+**新产生的编译错误（`-fsyntax-only` 抓到，cmake 也会报）**：
+
+```
+Core/Src/stm32f4xx_it.c:266:6: error: redefinition of 'I2C2_EV_IRQHandler'
+Core/Src/stm32f4xx_it.c:220:6: note: previous definition of 'I2C2_EV_IRQHandler' with type 'void(void)'
+```
+
+**根因**：CubeMX 现在**自己会生成** `I2C2_EV_IRQHandler`（因为 `.ioc` 有了
+`NVIC.I2C2_EV_IRQn=true\:0\:0\:...`），但我早先在 `USER CODE BEGIN 1` 区里手写的
+那份还在 —— 同一符号两个定义。
+
+> ⚠ **教训：`USER CODE` 区能保护代码不被删，但保护不了代码变得多余。**
+> 一旦把某个配置从"手写补丁"变成"CubeMX 正式生成"，就必须**回去把补丁删掉**，
+> 否则就是重定义。补丁的生命周期要跟着配置走。
+
+**修法**：删掉 `USER CODE BEGIN 1` 里手写的 `I2C2_EV_IRQHandler`，**保留
+`I2C2_ER_IRQHandler`**（ER 的 NVIC 仍然没勾，CubeMX 不会生成），并把那里的注释
+从"两个 Handler 为什么都要手写"改写成"为什么只剩 ER 是手写的"。
+
+**当前 I2C2 中断的真实分工（重要，别再搞混）**：
+
+| 中断 | 谁生成 | 在哪使能 NVIC | 作用 |
+|---|---|---|---|
+| `I2C2_EV_IRQHandler` | **CubeMX**（`.ioc` 已勾 `NVIC.I2C2_EV_IRQn`） | `Core/Src/i2c.c:138-139` 的 `HAL_I2C_MspInit()` 里，由 CubeMX 生成 | TC 中断把 `hi2c2.State` 从 `BUSY_TX` 放回 `READY` |
+| `I2C2_ER_IRQHandler` | **手写**（`.ioc` 里没勾 error interrupt） | `Core/Src/i2c.c` 的 `USER CODE BEGIN I2C2_MspInit 1` 区，手写补 | 总线错误时清标志、踢回 `READY` |
+
+**`Core/Src/dma.c` 里不再需要任何 I2C2 代码**（上一轮补的 4 行已被 CubeMX 删掉，
+现在也不需要补回去 —— NVIC 使能已经移到 `i2c.c` 的 `HAL_I2C_MspInit()` 里，
+那才是它本来该在的位置）。
+
+**`Core/Src/i2c.c` 手写补丁**（放在 `USER CODE BEGIN I2C2_MspInit 1` 区）：
+
+```c
+HAL_NVIC_SetPriority(I2C2_ER_IRQn, 0, 0);
+HAL_NVIC_EnableIRQ(I2C2_ER_IRQn);
+```
+
+> **想一劳永逸**：在 CubeMX 的 NVIC 页把 "I2C2 error interrupt" 也勾上，
+> 然后回来删掉这里的 2 行**和** `stm32f4xx_it.c` 里手写的 `I2C2_ER_IRQHandler`
+> —— 两个都要删，不然又是重定义（`I2C2_EV_IRQHandler` 刚踩过）。
+
+**`Core/Src/main.c` 的 `MX_LWIP_Init()` 位置问题（第二次被覆盖）**：
+
+`.ioc:188` 的 `ProjectManager.functionlistsort` 把 `MX_LWIP_Init()` 排在
+`MX_I2C2_Init()` **之前**（`5-MX_LWIP_Init-LWIP-false-HAL-false,6-MX_I2C2_Init-I2C2-false-HAL-true`），
+所以**每次重新生成都会在 `MX_I2C2_Init()` 前面插一行 `MX_LWIP_Init();`**，
+这违反 §3.3（`ETH_PHY_ReleaseReset()` 要靠 I2C2，必须排在 `MX_LWIP_Init()` 之前）。
+
+这次的修法**换成了标记 + 注释**，因为单纯删掉它下次还会回来：
+
+```c
+  MX_USART1_UART_Init();
+  /* USER CODE BEGIN MX_LWIP_Init_Disabled */
+  /* 【本工程刻意删掉了 CubeMX 生成的 MX_LWIP_Init();】 ... 理由 ... */
+  /* USER CODE END MX_LWIP_Init_Disabled */
+  MX_I2C2_Init();
+```
+
+> **更彻底的办法**：去 CubeMX 的 Project Manager → Advanced Settings，把
+> `MX_LWIP_Init` 的调用顺序拖到 `MX_I2C2_Init` 之后，那样 CubeMX 就不会再插错位置。
+> **没做这一步之前，每次重新生成都要检查这一行。**
+
+**验证**：`arm-none-eabi-gcc -fsyntax-only -Wall -Wextra -std=gnu11` 检查
+`main.c` / `i2c.c` / `dma.c` / `stm32f4xx_it.c` / `framebuf.c` / `echo_service.c` /
+`reg_shell.c` / `oled.c` / `ethernetif.c` / `eth_phy.c` / `board_io.c` / `font.c`
+→ **12 个全 OK，零警告**。
+
 ### 2026-02-13 — I2C2 提到 400kHz + 修复 CubeMX 重新生成的覆盖
 
 **背景**：用户把 I2C2 从 100kHz 改成 400kHz（`ETHERNETtest.ioc` 新增

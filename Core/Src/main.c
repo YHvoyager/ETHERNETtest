@@ -27,7 +27,8 @@
 /* USER CODE BEGIN Includes */
 #include "debug_uart.h"
 #include "eth_phy.h"
-#include "udp_echo.h"
+#include "echo_service.h"   /* 带话术的回声服务（当前启用） */
+#include "udp_echo.h"       /* 原样回环（保留，未启用，端口与上面冲突） */
 /* gnetif 定义在 LWIP/App/lwip.c，但 lwip.h 没有 extern 它，这里自己声明 */
 extern struct netif gnetif;
 /* USER CODE END Includes */
@@ -125,11 +126,17 @@ int main(void)
          gnetif.hwaddr[3], gnetif.hwaddr[4], gnetif.hwaddr[5]);
   printf("[IP ] ping 192.168.1.30 from the PC now\r\n");
 
-  /* UDP 回环。必须在 MX_LWIP_Init() 之后（netif 得先 add/up，udp_bind 才有意义）。
-   * 失败不阻塞主循环，否则连 ping 都做不了。 */
-  if (UDP_Echo_Init() != 0)
+  /* UDP 回声服务。必须在 MX_LWIP_Init() 之后（netif 得先 add/up，udp_bind 才有意义）。
+   * 失败不阻塞主循环，否则连 ping 都做不了。
+   *
+   * 【注意】echo_service.c 和 udp_echo.c 功能重叠且默认都用 8080 端口，
+   * 一个 UDP 端口只能被一个 pcb 绑定，所以这里二选一。当前用带话术的
+   * echo_service（回复"我收到你的信息了，是 xxx 吗？"）。要换回原样回环，
+   * 把下面这行注释掉、启用 UDP_Echo_Init()/UDP_Echo_Poll() 即可（二者端口
+   * 相同，绝不能同时开）。 */
+  if (Echo_Service_Init() != 0)
   {
-    printf("[ERR] UDP_Echo_Init() failed -- echo service unavailable\r\n");
+    printf("[ERR] Echo_Service_Init() failed -- echo service unavailable\r\n");
   }
   /* USER CODE END 2b */
 
@@ -142,7 +149,7 @@ int main(void)
     /* USER CODE BEGIN 3 */
     MX_LWIP_Process();
 
-    UDP_Echo_Poll();   /* 非阻塞，内部 1 秒节流；只在收到过包之后才发 */
+    Echo_Service_Poll();   /* 非阻塞，内部 1 秒节流；只在收到过包之后才发 */
   }
   /* USER CODE END 3 */
 }

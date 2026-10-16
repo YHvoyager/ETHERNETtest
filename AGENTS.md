@@ -1,7 +1,7 @@
 # AGENTS.md — ETHERNETtest 工程工作手册
 
 > **本文件给未来的 AI 助手（和我自己）看。每次改动代码后必须更新本文件。**
-> 最后更新：2026-02-13 | 当前提交：`872e524`
+> 最后更新：2026-02-13 | 当前提交：`872e524`（本次提交写入时尚未生成哈希）
 
 ---
 
@@ -103,6 +103,7 @@ arm-none-eabi-objcopy.exe -O ihex build/Debug/ETHERNETtest.elf build/Debug/ETHER
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/debug_uart.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/eth_phy.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/echo_service.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/udp_echo.c
 )
 ```
@@ -124,11 +125,13 @@ ETHERNETtest/
 │   ├── Inc/
 │   │   ├── eth_phy.h          板级补丁接口（3 函数）
 │   │   ├── debug_uart.h       printf 重定向接口
-│   │   ├── udp_echo.h         UDP 回环接口
+│   │   ├── echo_service.h     带话术的回声服务接口（**当前启用**）
+│   │   ├── udp_echo.h         UDP 原样回环接口（保留，未启用）
 │   │   ├── main.h / i2c.h / usart.h / gpio.h / stm32f4xx_it.h / stm32f4xx_hal_conf.h
 │   └── Src/
 │       ├── eth_phy.c          ★ 板级补丁（MspInit + PHY 复位 + PHY 准备 + 诊断）
-│       ├── udp_echo.c         ★ UDP 回环服务
+│       ├── echo_service.c     ★ 带话术的 UDP 回声（当前启用的应用）
+│       ├── udp_echo.c         UDP 原样回环（保留，未启用，端口与上面冲突）
 │       ├── debug_uart.c       printf → USART1
 │       ├── main.c             初始化顺序 + 主循环
 │       ├── i2c.c / usart.c / gpio.c / stm32f4xx_hal_msp.c / stm32f4xx_it.c
@@ -152,9 +155,15 @@ ETHERNETtest/
 |---|---|---|
 | `Core/Src/eth_phy.c` | 把 CubeMX 漏掉的三件事集中于此 | **本工程最重要的文件** |
 | `Core/Src/main.c` | 初始化顺序（**不能改**） | 见 3.3 |
-| `Core/Src/udp_echo.c` | UDP 8080 回环 + 每秒心跳 | 非阻塞 |
+| `Core/Src/echo_service.c` | **当前启用的应用**：UDP 8080 带话术回声 + 每秒心跳 | 见 3.5 |
+| `Core/Src/udp_echo.c` | UDP 8080 原样回环 + 每秒心跳 | **未启用**，端口与上面冲突 |
 | `LWIP/App/lwip.c` | `gnetif` 定义（`:45`）、IP 配置（`:63-66`） | |
 | `LWIP/Target/ethernetif.c` | 网卡驱动，5 处手工改动 | 见 3.4 |
+
+> ⚠ **`echo_service.c` 与 `udp_echo.c` 不能同时启用**：两者功能重叠且默认都用
+> **8080** 端口，一个 UDP 端口只能被一个 pcb 绑定（第二个 `udp_bind` 返回 `ERR_USE`）。
+> `main.c` 里二选一，当前用 `Echo_Service_Init()`。要换回原样回环，把
+> `Echo_Service_Init()`/`Echo_Service_Poll()` 注释掉、启用 `UDP_Echo_Init()`/`UDP_Echo_Poll()`。
 
 ### 3.2 `eth_phy.c` 四个函数
 
@@ -178,14 +187,17 @@ MX_LWIP_Init();                    /* 内部：ethernetif_init → low_level_ini
                                     *   → HAL_ETH_Init → HAL_ETH_MspInit
                                     *   → ETH_PHY_Prepare → HAL_ETH_Start */
 
-UDP_Echo_Init();                   /* netif 得先 add/up，udp_bind 才有意义 */
+Echo_Service_Init();               /* 当前启用。netif 得先 add/up，udp_bind 才有意义 */
 
 while (1)
 {
   MX_LWIP_Process();               /* ethernetif_input + sys_check_timeouts + 链路检查 */
-  UDP_Echo_Poll();                 /* 非阻塞，内部 1 秒节流 */
+  Echo_Service_Poll();             /* 非阻塞，内部 1 秒节流 */
 }
 ```
+
+> **要换回 `udp_echo.c` 的原样回环**：把 `Echo_Service_Init()`/`Echo_Service_Poll()`
+> 换成 `UDP_Echo_Init()`/`UDP_Echo_Poll()`。**两者端口都是 8080，绝不能同时开。**
 
 > ⚠ **`while(1)` 里绝对不能加阻塞式轮询。** 曾经一个用未初始化句柄的轮询函数
 > 导致 CPU 被卡死、`MX_LWIP_Process()` 被饿死，表现为"每 64 秒报一次错"、ping 不通。
@@ -199,6 +211,56 @@ while (1)
 | `:213` | 调 `ethernet_link_check_state(netif)` | CubeMX 生成的是空函数 |
 | `:220` | 加 `HAL_ETH_Start(&heth)` | **ping 不通的直接原因** |
 | `:475` | 实现 `ethernet_link_check_state()` | 读 BSR bit2 判链路 |
+
+### 3.5 `echo_service.c` —— 带话术的回声服务（当前启用的应用）
+
+**功能**：收到任何 UDP 报文后，用中文话术回答，便于人肉核对内容：
+
+```
+我收到你的信息了，是"hello"吗？
+```
+
+**接口**（`Core/Inc/echo_service.h`）：
+
+| 函数 | 职责 |
+|---|---|
+| `Echo_Service_Init(void)` | `udp_new()` + `udp_bind(0.0.0.0, ECHO_SERVICE_PORT)` + `udp_recv()` |
+| `Echo_Service_Poll(void)` | 每秒向"最近一次来包的 PC"推中文心跳，非阻塞 |
+
+**关键常量**（`Core/Src/echo_service.c`）：
+
+| 宏 | 值 | 说明 |
+|---|---|---|
+| `ECHO_SERVICE_PORT` | `8080U` | 在 `.h` 里，可用 `#ifndef` 覆盖 |
+| `ECHO_MAX_PAYLOAD` | `260U` | 单条应答最多回显多少字节原文（**按字节，截断后会对齐到字符边界**） |
+| `ECHO_TX_BUF_SIZE` | `512U` | 组包缓冲；**static 而非栈上**，因为栈只有 1024 字节 |
+| `ECHO_BEAT_INTERVAL` | `1000U` | 心跳间隔 ms |
+
+**四个值得记住的实现细节**：
+
+1. **中文用 `\xNN` 转义写**（`"\xE6\x88\x91..."`），不直接把 UTF-8 汉字写进字符串
+   字面量。原因：源码文件编码、`-fexec-charset`、编译器对 BOM 的处理都会影响
+   直接写汉字的字节序列，而 `\x` 转义是 UTF-8 码元的精确表达，编出来的字节
+   与编译环境无关。
+2. **引号用 ASCII `"` (0x22)，不用全角 `"`**。全角引号是 3 字节，网络调试助手
+   编码设置稍有偏差就显示成乱码；ASCII 引号无此风险。句末的全角问号 `？`
+   (`\xEF\xBC\x9F`) 保留。
+3. **`sanitize_inplace()` 只过滤 `< 0x20` 的控制字符**，`0x7F` 及以上**原样保留**。
+   这是中文能回显的前提 —— UTF-8 汉字 3 个字节每个都 ≥ 0x80，早先写成
+   "`c < 0x20 || c > 0x7E` 就换成 `.`" 会把中文整个打成点（见 §8 排查表）。
+4. **截断必须先回退到字符边界**：`utf8_trim_incomplete()` 从开头按首字节推出每个
+   字符的长度（0x00~0x7F→1、0xC0~0xDF→2、0xE0~0xEF→3、0xF0~0xF7→4），只能输出
+   最后一个**完整**字符为止。直接把 260 字节硬砍，会把 3 字节的汉字砍成 1~2 字节，
+   那不是合法 UTF-8，助手只会显示成替换符。裸续字节（0x80~0xBF）和非法首字节
+   （0xF8~0xFF）按 1 字节透传，不悄悄改写别人的编码问题。
+   原始字节先收进 `static char s_rx_raw[ECHO_MAX_PAYLOAD + 4]`（多留 3 字节用于判断
+   末字符是否被砍断），再截断 + 过滤，**原始数据不被就地破坏**。
+
+> **为什么组包缓冲用 `static char s_tx_buf[512]`**：STM32F429 的栈是
+> `0x400` = 1024 字节（见 `startup_stm32f429xx.s`），回调里放 512 字节局部数组
+> 等于半个栈，加上 `printf` 的调用深度就危险了。该缓冲只在主循环上下文使用，
+> 不存在重入，static 是安全的。`s_rx_raw` 同理（原先它是个 261 字节的栈数组
+> `char text[ECHO_MAX_PAYLOAD + 1U]`，一并挪到了 static）。
 
 ---
 
@@ -259,6 +321,10 @@ RMII     : PA1 REF_CLK, PA2 MDIO, PA7 CRS_DV, PC1 MDC,
 | **保留 `eth_custom_phy_interface.c` 但不用它** | CubeMX 重新生成还会带上，删了白删 |
 | **MAC 地址尾段不能全零** | 某些网卡驱动会丢弃，导致链路通但 ping 不通 |
 | **PHY 地址硬编码 0，不扫描** | 板上 PHYADD0/1 都接了 LED；且 MDIO 悬空电平 `0x7FFF` 会造成假阳性 |
+| **`sanitize_inplace()` 只滤 `< 0x20`，不滤 `> 0x7E`** | UTF-8 汉字每字节都 ≥ 0x80，按 `> 0x7E` 过滤会把中文整句打死。控制字符才需要清 |
+| **截断回退到字符边界（`utf8_trim_incomplete()`）** | 3 字节的汉字被硬砍成 1~2 字节就不是合法 UTF-8，助手显示成替换符 |
+| **原始字节先收进 `s_rx_raw` 再在副本上加工** | 先截断+过滤会破坏原始数据，事后无法再判断"PC 到底发的什么编码" |
+| **`UDP_ECHO_HEXDUMP` 默认 0** | 115200 下打 32 字节的十六进制要 99 字符≈8.6ms，收包频繁时拖慢主循环 |
 
 ### 5.1 MDIO 地址扫描的假阳性（重要）
 
@@ -357,6 +423,9 @@ ping 192.168.1.30
 | 心跳间隔异常（如 64 秒） | 主循环被阻塞 | `while(1)` 里不能有阻塞轮询 |
 | 编译报 `undefined reference` | 新 .c 没登记 | 加到根 `CMakeLists.txt` 的 `target_sources()` |
 | 烧进去没变化 | hex 是旧的 | 重新 objcopy，检查时间戳 |
+| **回显的原文全变成 `.`** | `sanitize_inplace()` 把 ≥0x80 的字节也滤了 | 判据必须只有 `c < 0x20`；UTF-8 汉字每字节都 ≥0x80 |
+| **中文回显成乱码/替换符** | 截断砍断了多字节字符 | 用 `utf8_trim_incomplete()` 回退到字符边界 |
+| **想知道 PC 到底发的什么编码** | 缺原始字节观察手段 | 把 `udp_echo.c` 的 `UDP_ECHO_HEXDUMP` 置 1，看 `[UDP] raw` 行 |
 
 ---
 
@@ -413,6 +482,58 @@ clangd `.cache/`、`__pycache__/`、OS 垃圾文件。
 ## 10. 变更日志
 
 > **每次改动代码后在此追加一条，最新的在最上面。**
+
+### 2026-02-13 — 回声服务支持中文（本提交）
+
+**问题**：网络调试助手能收到回包，但发中文时回显的原文全变成 `.`（点）。
+
+**根因**（三个独立缺陷叠加）：
+
+1. **`sanitize_inplace()` 误杀**：老判据是 `c < 0x20 || c > 0x7E` 就换成 `.`。
+   本意是清理控制字符，但 UTF-8 汉字是 3 个字节、**每个都 ≥ 0x80**，于是整句中文
+   被逐字节打死。
+2. **硬截断砍断字符**：`pbuf_copy_partial(p, text, ECHO_MAX_PAYLOAD, 0)` 直接把
+   原文切到 260 字节，不问切点落在哪。3 字节的汉字被砍成 1~2 字节后不是合法
+   UTF-8 序列，助手只能显示成替换符。
+3. **缺少原始字节的观察手段**：串口上能看到的只有过滤后的字符串，无法区分
+   "PC 用 GBK 发的"和"板子改坏了"。
+
+**改动**：
+
+- `Core/Src/echo_service.c`：
+  - `sanitize_inplace()` 判据收窄为**只过滤 `c < 0x20`**，`0x7F` 及以上原样保留。
+  - 新增 `static size_t utf8_trim_incomplete(const char *s, size_t len)`：从开头按
+    首字节推算每个字符的长度（`<0x80`→1、`<0xC0`→1/裸续字节透传、`<0xE0`→2、
+    `<0xF0`→3、`<0xF8`→4、其余→1/非法首字节透传），只在字符完整时推进；遇到
+    超出 `len` 的不完整字符即停止并丢弃它。
+  - 新增 `static char s_rx_raw[ECHO_MAX_PAYLOAD + 4U]`：先把原始字节收到这里
+    （多收 3 字节用于判断末字符是否被砍断），再在副本上做截断 + 过滤，
+    **不再就地破坏原始数据**。
+  - 回调里的 261 字节栈数组 `char text[ECHO_MAX_PAYLOAD + 1U]` 改为指针
+    `char *text` 指向 `s_rx_raw` —— 栈只有 1024 字节，这个数组原本就占四分之一。
+  - 步骤编号重排为 1 取原文 / 2 决定安全长度 / 3 过滤控制字符 / 4 组装应答 /
+    5 发回，并修正了此前编号错乱（原有两个 `---- 2. ----`）。
+  - 截断提示改为按 `full_len` 判断，被字符边界回退时补一句
+    `(trimmed back to a character boundary)`。
+- `Core/Src/udp_echo.c`：新增 `UDP_ECHO_HEXDUMP` 开关（默认 `0`）与
+  `UDP_ECHO_RAW_SNIFF`（默认 `32U`），在**过滤之前**打印原始字节的十六进制：
+  `[UDP] raw 6 byte(s): E4 BD A0 E5 A5 BD`。默认关闭是因为 115200 下 32 字节的
+  十六进制要打 99 个字符≈8.6ms，收包频繁时会拖慢主循环。
+
+**如何判断是哪种编码**（打开 `UDP_ECHO_HEXDUMP` 后看 `[UDP] raw` 那行）：
+
+| 看到的字节 | 含义 |
+|---|---|
+| `E4 BD A0 E5 A5 BD` | 合法 UTF-8 中文（"你好"），发送端没问题 |
+| `C4 E3 BA C3` | **GBK** 编码，是助手的编码设置问题，不是板子 |
+| `3F 3F` | 发出前就已经是 `??` |
+| `EF BF BD` | 已经是 U+FFFD 替换符，上游就已损坏 |
+
+> ⚠ 非 UTF-8 编码（GBK）通过 `sanitize_inplace()` 时**不会被改动**，仍会显示成
+> 乱码 —— 那是发送端的问题。要用 GBK 就必须在 `sanitize_inplace()` 里做转码，
+> 但那要带码表（几千字节），当前不做。
+
+同步更新 AGENTS.md §3.5 / §5 / §8 / 变更日志。
 
 ### 2026-02-13 — 工作流约定修正（本提交）
 

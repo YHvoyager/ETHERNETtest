@@ -64,6 +64,22 @@ static uint32_t  s_last_beat_tick = 0U;
 static uint32_t  s_rx_count = 0U;
 
 /* ------------------------------------------------------------------------- */
+/* 调试开关：原始字节十六进制转储                                                */
+/* ------------------------------------------------------------------------- */
+
+/** 置 1 后每次收包都打印**未经任何过滤**的原始字节。
+ *  排查中文/编码类问题时会用到；平时置 0 免得串口刷屏（115200 下 32 字节的十六进制
+ *  要打 99 个字符，约 8.6ms，收包频繁时会影响主循环实时性）。 */
+#ifndef UDP_ECHO_HEXDUMP
+#define UDP_ECHO_HEXDUMP   0
+#endif
+
+/** 转储前多少个字节 */
+#ifndef UDP_ECHO_RAW_SNIFF
+#define UDP_ECHO_RAW_SNIFF 32U
+#endif
+
+/* ------------------------------------------------------------------------- */
 /* 收包回调                                                                    */
 /* ------------------------------------------------------------------------- */
 
@@ -87,6 +103,28 @@ static void udp_echo_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
   {
     return;   /* lwIP 约定：p == NULL 表示这个 pcb 出错了，什么都不用做 */
   }
+
+#if UDP_ECHO_HEXDUMP
+  /* ---- 原始字节十六进制转储（**在下面那层 '.' 掩码之前**）----
+   * 定位"中文显示不出来"这类问题的关键手段：这里打的是 PC 真正发过来的字节。
+   *   E4 BD A0 E5 A5 BD ...  -> 合法的 UTF-8 中文，问题不在发送端
+   *   C4 E3 BA C3 ...        -> GBK 编码，是发送端（助手/输入法）的编码设置问题
+   *   3F 3F / EF BF BD       -> 已经被替换成 '?' 或 U+FFFD，发出前就已经坏了
+   * 下面 [UDP] payload/hex 那两行是过滤后的结果，不能用来判断编码。 */
+  {
+    uint8_t rawhdr[UDP_ECHO_RAW_SNIFF];
+    u16_t   rawlen;
+    u16_t   k;
+
+    rawlen = pbuf_copy_partial(p, rawhdr, (u16_t)UDP_ECHO_RAW_SNIFF, 0);
+    printf("[UDP] raw %u byte(s):", (unsigned int)rawlen);
+    for (k = 0U; k < rawlen; k++)
+    {
+      printf(" %02X", (unsigned int)rawhdr[k]);
+    }
+    printf("\r\n");
+  }
+#endif
 
   /* 记住发信人，心跳要往这个地址发 */
   if (addr != NULL)

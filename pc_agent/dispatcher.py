@@ -244,8 +244,40 @@ _ANIM_WORDS = [
 _TROUBLE_RE = re.compile(
     r"没.{0,4}(字|图片|画面|内容)"          # 没字 / 没内容
     r"|(字|图片|画面|内容).{0,4}没"          # 字都没了 / 内容没了
+    r"|(屏幕|显示屏|屏).{0,4}(没|不|黑|白)"  # 屏幕没亮 / 屏不亮 / 屏幕黑了
     r"|什么都没有|没反应|不显示|坏了|不动了"
 )
+
+# "在问状态"而不是"在叫我修"。
+#   "刷屏卡不卡"里的"卡"会命中上面的"不动了"，"屏还在吗"同理。
+#   这些是**只读询问**，绝不能转成一次写操作 —— 宁可漏判（掉到 LLM），
+#   也不要让用户问一句就把屏给重置了。
+_ASK_INFO_RE = re.compile(
+    r"不卡|卡不|不亮|亮不|坏不|动不|还在|在吗|是否|吗|么样|怎么样|"
+    r"哪|多少|状态|status|stat|情况", re.I)
+
+# 要读但没说读哪个 → 列清单，别让 LLM 去猜一个地址
+_READ_ANY_RE = re.compile(
+    r"(读|看|查).{0,3}(寄存器|地址)|寄存器.{0,3}(值|多少|读)"
+    # "读一下 GPIOB"：报了端口名、没报寄存器名，也没有"多少/什么值"。
+    # ⚠ 必须要求**出现读动作**：光说 "GPIOB 是什么" 不算读取请求。
+    r"|(读|看|查|read).{0,6}gpio\s*[a-k]\b(?!\s*(?:的\s*)?(?:moder|otyper"
+    r"|ospeedr|pupdr|idr|odr|bsrr|lckr|afrl|afrh))", re.I)
+
+# 寄存器读取："GPIOB 的 IDR 是多少" / "读 40020014"
+#   ⚠ 端口和寄存器名**分开匹配**。别写成 `gpio\s*([a-k])\b(?:\s*(?P<reg>...))?`：
+#     那样 "GPIOB 的 IDR" 在 "GPIOB" 处就匹配成功（b 后面是 \b），reg 组恒为
+#     None，结果问哪个寄存器都回 ODR 的地址 —— 实测踩过。
+_REG_READ_RE = re.compile(r"gpio\s*(?P<port>[a-k])\b|\b(?P<addr>[0-9a-f]{8})\b", re.I)
+_REG_NAMES_RE = re.compile(
+    r"(?P<reg>moder|otyper|ospeedr|pupdr|idr|odr|bsrr|lckr|afrl|afrh)\b", re.I)
+# 寄存器偏移（端口基址 + 偏移），照 Core/Src/reg_shell.c 的白名单。
+# 不在表里的名字只读基址 4 个字，不假装知道偏移。
+_REG_OFFSETS = {
+    "MODER": 0x00, "OTYPER": 0x04, "OSPEEDR": 0x08, "PUPDR": 0x0C,
+    "IDR": 0x10, "ODR": 0x14, "BSRR": 0x18, "LCKR": 0x1C,
+    "AFRL": 0x20, "AFRH": 0x24,
+}
 
 _TXT_LINE_RE = re.compile(r"(?:第\s*(\d)\s*行|(\d)\s*行|line\s*(\d))", re.I)
 
@@ -314,21 +346,12 @@ def match_rules(text: str) -> RuleHit:
     low = s.lower()
 
     # ---- 屏幕电源：ON/OFF/CLR/FILL/INIT ----
-    # ⚠ 排障类说法（"屏上一个字都没了"）先单独收口，别被下面的动画词吃掉。
-    # ⚠ 而且必须放在"开屏"规则**前面**：否则 "屏幕上一个字都没了" 里的
-    #   "屏...都没" 会被 (开|亮).{0,3}屏 之外的模式误伤，或者倒过来被
-    #   "屏幕.*干净" 吃掉。
-    if _TROUBLE_RE.search(low):
-        if re.search(r"没亮|不亮|没反应|不显示", low):
-            return _plan(None, None, by="rule#trouble", raw=text,
-                         why="屏幕像是没亮。先发 \"开屏\"（OLED ON）或 "
-                             "\"重新初始化屏幕\"（OLED INIT），"
-                             "或运行 python agent.py --check 看板子还在不在")
-        return _plan(None, None, by="rule#trouble", raw=text,
-                     why="屏幕内容不对。先发 \"重新初始化屏幕\"（OLED INIT），"
-                         "再发 \"清屏\"，或者直接发 OLED 命令看当前画面")
+    # ⚠ 排障类说法**不在这里**收口（放在下面屏幕命令之后）。踩过的坑：
+    #   原先排障在最前面，把"屏幕没亮"整段抢走返回 OLED INIT，于是
+    #   "刷屏卡不卡"（含"卡"→不动了）和"屏幕没亮，帮我开屏"（含"没亮"）
+    #   全被判成排障。**用户说的是"开屏"就照开屏，别替他决定要不要重置。**
 
-    # ⚠ 顺序：排障 → 清屏 → 关屏 → 开屏 → 全亮 → INIT。
+    # ⚠ 顺序：清屏 → 关屏 → 开屏 → 全亮 → INIT。
     #   "黑屏" 归**清屏**（用户说黑屏通常想擦干净画面）；要真熄屏说"关屏"。
     if re.search(r"清屏|清空屏|屏幕.{0,4}干净|黑屏|erase|清除", low):
         return _plan("cmd", "OLED CLR", by="rule#screen", why="清屏")
@@ -347,6 +370,75 @@ def match_rules(text: str) -> RuleHit:
         return _plan("cmd", "OLED FILL", by="rule#screen", why="全亮")
     if re.search(r"重新初始化|重init|re-?init|\binit\b", low):
         return _plan("cmd", "OLED INIT", by="rule#screen", why="重新初始化屏幕")
+
+    # ---- 排障：只管"没有对应命令"的说法 ----
+    # ⚠ 这里返回的是**可执行的下一步**（OLED INIT），不是一句提示。踩过的坑：
+    #   早先返回 action=None + why="先发 OLED INIT…" —— 前端只能显示"没听懂"
+    #   加一句建议，用户还得自己再打一遍。**建议本身就是一条命令**，
+    #   该直接给出来让他点确认，而不是把活推回给用户。
+    #   选 INIT 不选清屏：屏可能是被别的帧画满了，INIT 重走初始化并清屏，
+    #   两种情况都覆盖；清屏只覆盖后者。
+    #   _ASK_INFO_RE 挡掉"卡不卡/亮不亮/还在吗"这类**只读询问** ——
+    #   宁可漏判掉到 LLM，也不能让用户问一句就把屏重置了。
+    if (_TROUBLE_RE.search(low)
+            and not re.search(r"灯|led|网络|网口|ping", low)
+            and not _ASK_INFO_RE.search(low)):
+        if re.search(r"没亮|不亮|不显示|黑|白", low):
+            why = ("屏幕像是没亮。下一步：重新初始化屏幕并清屏（OLED INIT）；"
+                   "还不行就发 OLED ON 开显示，或运行 python agent.py --check "
+                   "看板子还在不在")
+        else:
+            why = "屏幕内容不对。下一步：重新初始化屏幕并清屏（OLED INIT）"
+        return _plan("cmd", "OLED INIT", by="rule#trouble", raw=text, why=why)
+
+    # ---- "要读，但没说读哪个" → 列清单 ----
+    # ⚠ 放在寄存器规则**之前**：否则 "读一下寄存器" 会掉到 LLM，
+    #   而 LLM 面对"差一个参数"的请求只会猜一个地址 —— 猜错比不猜更糟。
+    if _READ_ANY_RE.search(low):
+        return _plan("cmd", "HELP", by="rule#reg_any",
+                     why="没说读哪个寄存器，先把能读的列出来：GPIOA~GPIOK 的 "
+                         "MODER/OTYPER/OSPEEDR/PUPDR/IDR/ODR，"
+                         "或者说 \"读一下 GPIOB 的 ODR\"")
+
+    # ---- 寄存器读取：说端口名 → 自动算地址 ----
+    # 地址映射照抄 Core/Src/reg_shell.c 的白名单：
+    #   GPIOA..GPIOK = 0x40020000 起，每个端口 0x400；ODR 在端口基址 + 0x14。
+    # ⚠ 只在**出现读动作**或**说了寄存器名**时才出命令，否则
+    #   "GPIOB 是什么" 这种纯名词也会被当成读取请求。
+    # ⚠ 写操作不能被这里截走："W 40023800 0" 里也有 8 位地址，
+    #   它必须走到 _plan 里被 validate_cmd 拦成"RCC 只读"。
+    m = _REG_READ_RE.search(low)
+    if m and not re.search(r"\bw\b|\bwb\b|写|改|设|置设置|清|write|set", low):
+        port = (m.group("port") or "").upper()
+        addr_hex = (m.group("addr") or "").lower()
+        rn = _REG_NAMES_RE.search(low)
+        reg = (rn.group("reg") or "").upper() if rn else ""
+        want_read = bool(re.search(r"读|看|查|多少|多少位|什么值|what|read", low))
+        # 端口名后面跟了个**不认识的寄存器词**：只读基址 4 个字，别假装知道偏移
+        stray = port and not reg and re.search(
+            r"gpio\s*" + port.lower() + r"\s*(?:的\s*)?(?!的|是|在|有|为)([a-z]{3,})\b",
+            low)
+        if addr_hex or (port and (reg or want_read)):
+            if addr_hex:
+                addr = int(addr_hex, 16)
+                count = 1
+                label = "0x%08X" % addr
+            else:
+                base = 0x40020000 + (ord(port[-1]) - ord("A")) * 0x400
+                if stray:
+                    addr = base
+                    count = 4
+                    label = ("GPIO%s 基址 0x%08X（不认识寄存器 \"%s\"，只读前 4 个 "
+                             "32 位字，列表见 HELP）" % (port[-1], addr, stray.group(1)))
+                else:
+                    off = _REG_OFFSETS.get(reg, 0x14)   # 没点名就默认 ODR
+                    addr = base + off
+                    count = 1
+                    label = "GPIO%s %s(0x%08X)" % (port[-1], reg or "ODR", addr)
+            return _plan("cmd", "R %08x %d" % (addr, count), by="rule#reg",
+                         why="读 %s" % label,
+                         extra={"addr": addr, "port": port[-1:] or None,
+                                "reg": reg or None, "count": count})
 
     # ---- LED：必须带"灯"，否则"开车"会被当成开灯 ----
     if re.search(r"灯|led|led0|led1|ds[01]", low):

@@ -83,8 +83,24 @@
 {"raw": "给我讲个笑话", "action": null}
 {"raw": "今天天气怎么样", "action": null}
 
-# ---- 排障类说法：要给出提示，而不是乱猜一个动画 ----
-{"raw": "屏幕上一个字都没了", "action": null}
+# ---- 排障类说法：给出**可执行**的下一步，而不是一句空提示 ----
+# 返回 OLED INIT 而不是 null：建议本身就是一条命令，让用户点确认，
+# 不要让他把我们刚说过的话自己再打一遍。
+{"raw": "屏幕上一个字都没了", "action": "cmd", "arg": "OLED INIT"}
+{"raw": "屏幕没亮", "action": "cmd", "arg": "OLED INIT"}
+# 但"问我状态"的说法不能被当成排障转成写操作
+{"raw": "刷屏卡不卡", "action": "query", "arg": "OLED STAT"}
+
+# ---- 寄存器读取：端口名自动算地址，别掉给 LLM 去猜 ----
+{"raw": "GPIOB 的 IDR 是多少", "action": "cmd", "arg": "R 40020410 1"}
+{"raw": "GPIOB 的 PUPDR 是多少", "action": "cmd", "arg": "R 4002040c 1"}
+{"raw": "GPIOB 的 ODR 是多少", "action": "cmd", "arg": "R 40020414 1"}
+{"raw": "读 40020014", "action": "cmd", "arg": "R 40020014 1"}
+# 只说了端口、没说读哪个寄存器：回 HELP 列清单，别猜一个地址
+{"raw": "读一下 GPIOB", "action": "cmd", "arg": "HELP"}
+{"raw": "读一下寄存器", "action": "cmd", "arg": "HELP"}
+# 纯名词不是读取请求
+{"raw": "GPIOA 是什么", "action": null}
 
 # ---- 中文名词陷阱：别把"马上""汽车站"当成动画 ----
 {"raw": "我马上回来", "action": null}

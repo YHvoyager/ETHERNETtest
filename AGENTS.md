@@ -701,6 +701,36 @@ dispatcher.py "把灯打开"
 | 述宾方向搞反 | `没.{0,4}字` 对 "屏幕上一个字都**没了**" 永远不命中 | 两个方向都写：`没.{0,4}字\|字.{0,4}没` |
 | 动词正则吞掉别的领域 | `(开\|亮)(屏幕\|屏)?` 里的 `(屏幕\|屏)?` 是**可选**的，等于裸"打开"也算开屏 → "把灯打开"被判成 OLED ON | 判"屏"必须要求"屏"字真的出现，且和动词紧挨 |
 | 参数被丢掉 | "播眼睛 5 秒" → 只认出 anim=eyes，5 秒没了 | 规则层顺便抽 `([\d.]+)\s*秒` / `([\d.]+)\s*倍速` 塞进 extra |
+| 规则太靠前会把后面的说法抢走 | 排障规则放在屏幕命令**之前**，于是"刷屏**卡**不卡"（卡→不动了）和"屏幕**没亮**，帮我开屏"（没亮）都被判成排障 → OLED INIT | 排障放**屏幕命令之后**。**用户说"开屏"就照开屏，别替他决定要不要重置** |
+| 询问被当成命令 | "刷屏卡不卡""屏还在吗" 命中排障词后变成一次写操作 | `_ASK_INFO_RE`（不卡/卡不/不卡/亮不/还在/吗/哪/多少/状态/stat）挡一道。宁可漏判掉到 LLM，也不要"用户问一句就把屏重置了" |
+| 命名组与取值对不上 | `_REG_READ_RE` 加了个 `reg` 组后，代码里还取 `m.group("word")` → `IndexError: no such group`（`py_compile` 抓不到，只有真跑一遍才炸） | 规则代码取值和正则分组**一一核对**；可选组的结果可能是 `None`，取前先判 |
+| 可选分支让后续永远匹配不到 | `gpio\s*([a-k])\b(?:\s*(?P<reg>idr\|odr…))?` —— "GPIOB 的 IDR" 在 "GPIOB" 处就匹配成功，reg 恒为 None，于是**问哪个寄存器都回 ODR 的地址** | 端口名和寄存器名**分开匹配**（`_REG_READ_RE` + `_REG_NAMES_RE`） |
+| 读规则截走写操作 | "W 40023800 0" 里的 `40023800` 命中 8 位地址规则 → 变成只读的 `R 40023800 1`，api 自测里"写 RCC 被拦"直接失败 | 寄存器规则开头排除 `\bw\b\|wb\|写\|改\|设\|清`，让写命令走到 `validate_cmd` |
+
+**排障规则给的是"可执行的下一步"**（2026-10-18 改）：命中排障说法时返回
+`action=cmd, arg="OLED INIT"`（`needs_confirm=true`），**不是** `action=None` + 一句建议。
+理由：建议本身就是一条命令，前端只显示"没听懂"是浪费 —— 让用户点确认，
+而不是把我们刚说过的话自己再打一遍。选 INIT 不选清屏：屏可能被别的帧画满了，
+INIT 重走初始化并清屏，两种情况都覆盖。
+
+**寄存器读取**（`rule#reg` / `rule#reg_any`）：
+
+| 说法 | 结果 |
+|---|---|
+| `GPIOB 的 IDR 是多少` | `R 40020410 1`（基址 `0x40020000 + 1×0x400`，IDR 偏移 `0x10`） |
+| `GPIOB 的 ODR 是多少` | `R 40020414 1` |
+| `读 40020014` | `R 40020014 1`（8 位十六进制地址直接读） |
+| `读一下 GPIOB` / `读一下寄存器` | `HELP`（`rule#reg_any`）—— 没说读哪个，回清单，别让 LLM 猜地址 |
+| `GPIOB 的 PUPDR 是多少` | `R 40020400 4`（端口基址起 4 个字，**不猜**偏移） |
+| `GPIOA 是什么` | 拒绝 —— 纯名词不是读取请求 |
+
+```python
+_REG_READ_RE  = re.compile(r"gpio\s*(?P<port>[a-k])\b|\b(?P<addr>[0-9a-f]{8})\b", re.I)
+_REG_NAMES_RE = re.compile(r"(?P<reg>moder|otyper|ospeedr|pupdr|idr|odr|bsrr|lckr|afrl|afrh)\b", re.I)
+_REG_OFFSETS  = {"MODER":0x00, "OTYPER":0x04, "OSPEEDR":0x08, "PUPDR":0x0C,
+                 "IDR":0x10, "ODR":0x14, "BSRR":0x18, "LCKR":0x1C, "AFRL":0x20, "AFRH":0x24}
+```
+
 
 **实测踩到的固件不匹配**：`LED DS0 1` 会让板子回
 `ERR: bad LED index 'DS0'` —— 实际固件只认**数字索引**，要发 `LED 0 1`
@@ -1293,6 +1323,66 @@ clangd `.cache/`、`__pycache__/`、OS 垃圾文件，以及 **`pc_agent/dispatc
 ## 10. 变更日志
 
 > **每次改动代码后在此追加一条，最新的在最上面。**
+
+### 2026-10-18 — 页面报"没听懂"的两条说法：补排障与寄存器规则
+
+**现象**（用户实点页面）：`屏幕上一个字都没了` 和 `读一下 GPIOB` 都显示
+「没听懂」。前者 `by=rule#trouble` 但 `action=null`，后者 `by=llm` 也没给出动作。
+
+**根因**：① 排障规则命中后返回 `action=None` + 一句"先发 OLED INIT…"的
+**建议文本** —— 前端只能显示"没听懂"，用户还得把建议自己再打一遍。
+② 规则层完全没有寄存器读取的说法，`GPIOB` 这种"一半人话一半符号"的输入
+必然掉到 LLM。详见 §3.12.1。
+
+**改动**（全部在 `pc_agent/dispatcher.py` 的规则层，`api.py` 一行没动）：
+
+1. **排障改给可执行动作**：返回 `action=cmd, arg="OLED INIT"`（`needs_confirm=true`）。
+   选 INIT 不选清屏 —— 屏可能被别的帧画满了，INIT 重走初始化并清屏两种情况都覆盖。
+2. **新增 `rule#reg`**（寄存器读取）：`GPIOB 的 IDR 是多少` → `R 40020410 1`；
+   `读 40020014` → `R 40020014 1`。基址 `0x40020000 + (端口-'A')*0x400`，偏移表
+   `_REG_OFFSETS`（MODER 0x00 … ODR 0x14 … AFRH 0x24）。点名的寄存器不在表里时
+   **只读基址 4 个字**，不猜偏移。
+3. **新增 `rule#reg_any`**：`读一下 GPIOB` / `读一下寄存器` → `HELP`。
+   没说读哪个就回清单 —— LLM 面对"差一个参数"的请求只会猜一个地址，猜错比不猜更糟。
+4. **`_TROUBLE_RE` 扩展** `(屏幕|显示屏|屏).{0,4}(没|不|黑|白)`，覆盖"屏幕没亮/屏幕黑了"。
+
+**修的过程中又踩了四个坑**（都已写进 §3.12.1 的陷阱表，都是"跑一遍才炸"的）：
+
+| 坑 | 症状 |
+|---|---|
+| 命名组和取值对不上 | `IndexError: no such group`（先缺 `reg`/`word`，补完 `reg` 还剩 `word`） |
+| 可选组 `(?:...)?` 让后续永远匹配不到 | `GPIOB 的 IDR` 在 `GPIOB` 处就匹配成功 → **问哪个寄存器都回 ODR 的地址**。改成端口名与寄存器名分开匹配 |
+| 排障规则放太靠前会抢走后面的说法 | `刷屏卡不卡`（卡→不动了）和 `屏幕没亮，帮我开屏`（没亮）全被判成排障 → OLED INIT。把排障**挪到屏幕命令之后**，并加 `_ASK_INFO_RE` 挡掉"卡不卡/亮不亮/还在吗"这类只读询问 |
+| 读规则截走写操作 | `W 40023800 0` 里的 8 位地址命中读规则 → 变成 `R 40023800 1`，**api 自测里"写 RCC 被拦"当场失败** |
+
+> ⚠ 最后一条是**自测集当场抓到的**，不是我想到的。这就是"改规则必须两套自测都跑"
+> 的价值：`dispatcher --test` 只测规则层自己不矛盾，只有 `api --selftest` 会
+> 端到端检查"写 RCC 必须被拒"。**只跑一套等于没跑。**
+
+**验证**：
+
+- `python pc_agent/dispatcher.py --test` → 自测集 58 → **67 条**，规则层 **101/101**，未命中 8 条。
+  新增 10 条用例（3 条寄存器有名 + 读地址 + 2 条只报端口 → HELP + 纯名词拒 + 屏幕没亮 + 刷屏卡不卡）。
+  其中 `"屏幕上一个字都没了"` 的期望从 `action: null` **改成 `cmd/OLED INIT`** —— 这是有意的行为变更。
+- `python pc_agent/api.py --selftest` → **33/33 失败 0**。
+- 真机端到端（重启服务后，模拟浏览器的 `/dispatch` 路径）：
+
+```
+[PASS] 读一下 GPIOB            -> done by=rule#reg_any arg=HELP
+[PASS] GPIOB 的 IDR 是多少     -> done by=rule#reg arg=R 40020410 1  reply='OK R 0x40020410 = 0x0000101B'
+[PASS] 读 40020014             -> done by=rule#reg arg=R 40020014 1    reply='OK R 0x40020014 = 0x00000000'
+[PASS] 屏幕上一个字都没了       -> needs_confirm by=rule#trouble arg=OLED INIT preview=['OLED INIT']
+[PASS] 屏幕没亮                -> needs_confirm by=rule#trouble arg=OLED INIT
+[PASS] 刷屏卡不卡              -> done by=rule#query arg=OLED STAT
+[PASS] 在吗                    -> done by=rule#query arg=PING  reply='PONG tick=394032'
+失败 0 / 7
+```
+
+> ⚠ **第一次跑这 7 条时失败 2 条，原因不是代码**：8765 端口上有**两个** python
+> 进程在 LISTENING（旧的 15:13 那个没退干净，新代码跑在 15:19 那个上），
+> 请求随机落到旧进程，于是看到的是旧规则。`job_kill` 杀不掉 detached 的子进程，
+> 得按 PID `Stop-Process`。**改完 `dispatcher.py` 一定要确认服务真的重启了** ——
+> 判据是 `netstat -ano | Select-String ':8765'` 只剩一个 PID，而不是"我执行过重启"。
 
 ### 2026-02-13 — 修「播放个烟花」报 `anim 的执行器还没接` + proto 心跳错位
 

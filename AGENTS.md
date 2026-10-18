@@ -2485,3 +2485,26 @@ AF7 / PA9 / PA10 / GPIOA 时钟 / USART1 时钟全部正确。
 > ⚠ 沙箱/受限权限下 `Get-PnpDevice` / `Get-NetIPAddress` / `Get-NetAdapter` /
 > `Get-NetRoute` / `Get-CimInstance` 会**静默返回空**。此时改用原生命令：
 > `reg query`、`netstat -ano`、`ipconfig`、`route print`、`arp -a`、`tasklist`。
+
+### 2026-10-18 — codex 分支学科知识库
+
+- 新增 `pc_agent/knowledge_db.json`，提供信号与系统、数字信号处理、大学物理普通物理学、机器人控制的数学四科的结构化主题数据。
+- 每个主题包含摘要、常用公式和易错点；每科附带自测问题，便于 agent 后续生成复习回答。
+- 新增 `pc_agent/knowledge.py`，提供 UTF-8 数据加载、科目别名解析、关键词检索、文本格式化和命令行查询。
+- 数据库为离线资源，不影响固件构建；后续可将 `dispatcher` 的 `knowledge` action 接入该模块。
+
+### 2026-10-18 — 接入知识问答执行链路
+
+- `dispatcher.py` 新增本地学科问答规则，并允许 `knowledge` action 携带完整问题文本。
+- `api.py` 新增知识库检索执行器：返回完整答案，同时把中文摘要用 PC 端点阵渲染后通过现有帧通道发送至 OLED。
+- 首版不需要新的 API；仅依赖本地 `knowledge_db.json`。板子离线时仍可检索，OLED 发送会返回明确错误。
+
+### 2026-10-18 — 知识问答 OLED 分页与按键回传
+
+- `Core/Src/echo_service.c` 轮询 PA0/PH2，按当前 GPIO 上下拉配置分别识别为 UP（高有效）和 DOWN（低有效），使用 30 ms 非阻塞去抖，仅在按下边沿向最近 PC peer 发送 `KEY UP` / `KEY DOWN`。
+- 新增 `pc_agent/knowledge_pager.py`：复用一个长期 UDP socket 接收按键事件，并把知识答案按 4 行×8 字符分页，通过 FBSEQ 刷新 OLED；按键到达首尾页时保持边界。
+- `api.py` 的知识 action 使用分页器发送第 1 页；`GET /knowledge/page` 和 `/healthz` 返回当前页码。服务关闭时释放监听 socket。
+- 不需要新的外部 API；PC 与 STM32 仍使用 UDP 8080，浏览器仍使用现有本地 HTTP API。
+- 修复 LLM 知识分派：模型即使只返回科目名，也会由分派器恢复用户完整原问题，避免“傅里叶变换”被截成“数字信号处理”。修改 `api.py` 后必须重启已运行的前端进程才能生效。
+- 修复 `Core/Src/main.c` 启动时重复调用 `MX_LWIP_Init()` 的问题：第一次调用发生在 I2C2 初始化和 `ETH_PHY_ReleaseReset()` 之前，可能让 PHY 初始化失败并卡在错误循环，导致 OLED 开机画面和 UDP 服务都无法到达；现在只保留释放 PHY 复位后的那一次调用。
+- 根据串口日志修复 `LWIP/Target/ethernetif.c` 中空的 `ethernet_link_check_state()`：现在每 100 ms 调用 `ETH_PHY_CheckLink()`，链路协商完成后设置 lwIP 的 link-up 标志，恢复 UDP 回包。

@@ -100,23 +100,6 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART1_UART_Init();
-  /* USER CODE BEGIN MX_LWIP_Init_Disabled */
-  /* 【本工程刻意删掉了 CubeMX 生成的 MX_LWIP_Init();】
-   *
-   * CubeMX 的 Project Manager → functionlistsort 把 MX_LWIP_Init() 排在这里
-   * （见 ETHERNETtest.ioc 的 ProjectManager.functionlistsort），也就是
-   * MX_I2C2_Init() **之前**。但本工程绝对不能这么排：
-   *
-   *   ETH_PHY_ReleaseReset() 要靠 I2C2 写 PCF8574 去释放 PHY 复位，
-   *   而 MX_LWIP_Init() 内部的 HAL_ETH_Init() 会去读 PHY。顺序反了就等于
-   *   对着一个还在复位状态的 PHY 初始化网卡 —— 现象是链路灯全灭、ping 不通。
-   *   详见 §3.3 / §4 故障 #1。
-   *
-   * 正确的调用点在下面对 ETH_PHY_ReleaseReset() 成功之后再补。
-   * ⚠ 每次 CubeMX 重新生成都会把这行加回来，记得再删一次
-   *   （或者去 Project Manager 页把 functionlistsort 的顺序调整好）。
-   */
-  /* USER CODE END MX_LWIP_Init_Disabled */
   MX_I2C2_Init();
   /* USER CODE BEGIN 2 */
   Debug_UART_Banner("ETHERNETtest boot (step 3: lwip)");

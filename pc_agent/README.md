@@ -387,3 +387,21 @@ python pc_agent/agent.py check      # 里面有 FB? 一行
 | 页面上说"播个烟花"，回包是 `STM32F429 在线…` | 拿到的是**每秒心跳**不是 `FB?` 的回应（`FB: good=…`），说明 `proto.py` 的过滤或服务进程是旧的 —— **改完 `.py` 要重启 `api.py`** |
 | 页面报 `xxx 的执行器还没接` | 画面动作不该走 `/dispatch`：服务端只回 `play:true`，帧由前端再发 `/play` |
 | LLM 报错 | 看提示，通常是没设 `DEEPSEEK_API_KEY` |
+
+### 本地学科知识库
+
+`knowledge_db.json` 为离线结构化数据库，包含信号与系统、数字信号处理、大学物理普通物理学、机器人控制的数学四科。每科按主题保存摘要、公式、易错点和自测题，不需要 API key 或网络。
+
+```bash
+python pc_agent/knowledge.py
+python pc_agent/knowledge.py 采样 --subject 信号与系统
+python pc_agent/knowledge.py 雅可比 --subject 机器人控制的数学 --limit 3
+```
+
+`knowledge.py` 可作为模块调用：`knowledge.search(query, subject, limit)` 返回可序列化结果，`knowledge.format_results()` 负责文本展示。
+
+知识答案分页由 `knowledge_pager.py` 管理：OLED 按 4 行×8 字符分页。STM32 的 PA0（UP）和 PH2（DOWN）经过固件去抖后，经 UDP 8080 向最近的 PC peer 发送 `KEY UP` / `KEY DOWN`；PC 监听同一 socket，收到事件后刷新上一页/下一页。当前页可通过 `GET /knowledge/page` 查看，服务停止时会关闭监听 socket。
+
+### 知识问答执行链路
+
+前端 `/dispatch` 识别带有学科与提问词的文本为 `knowledge` action；`api.run_plan()` 调用 `knowledge.search()` 和 `format_results()`，将完整答案返回浏览器，并用 `bitmap.render_text()` 把前两条检索摘要渲染成 4 行中文点阵，通过现有 `Board.send_frame()` 发到 OLED。该链路使用本地 JSON，不新增 API 或密钥；若板子离线，检索答案仍会生成，但返回 OLED 发送错误。

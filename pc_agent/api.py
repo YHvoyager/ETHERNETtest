@@ -76,6 +76,10 @@ if _HERE not in sys.path:
 import agent            # noqa: E402
 import anim             # noqa: E402
 import dispatcher       # noqa: E402
+import bitmap           # noqa: E402
+from canvas import Canvas  # noqa: E402
+from knowledge import format_results, search  # noqa: E402
+from knowledge_pager import PAGER  # noqa: E402
 from proto import Board, BoardError, DEFAULT_HOST, DEFAULT_PORT  # noqa: E402
 from sandbox import SandboxError  # noqa: E402
 
@@ -223,7 +227,7 @@ def run_plan(plan: Dict[str, Any], host: str, port: int, timeout: float,
     out: Dict[str, Any] = {"ok": False, "sent": [], "reply": "", "error": ""}
 
     # 这两类在阶段一就只有占位，阶段二也不假装能执行 —— 明确说"还没接"。
-    if action in ("render", "knowledge"):
+    if action == "render":
         out["error"] = ("action=%s 的执行器还没接（见 AGENTS.md §11 待办）"
                         % action)
         return out
@@ -245,6 +249,21 @@ def run_plan(plan: Dict[str, Any], host: str, port: int, timeout: float,
                         % action)
         return out
 
+    if action == "knowledge":
+        question = str(arg or "").strip()
+        results = search(question, limit=2)
+        answer = format_results(results)
+        display_text = " ".join(item["topic"] + " " + item["summary"] for item in results[:2]) or "未找到相关知识"
+        try:
+            page = PAGER.show(display_text, host, port)
+            out["sent"] = ["KNOWLEDGE OLED PAGE 1/%d" % page["pages"]]
+            out["page"] = page
+            out["reply"] = answer
+            out["ok"] = True
+        except (BoardError, RuntimeError, OSError) as e:
+            out["reply"] = answer
+            out["error"] = "知识已检索，但 OLED 显示失败：%s" % e
+        return out
     cmd = arg if action in ("cmd", "query") else None
     if not cmd:
         # 走到这里说明 action 是 ACTIONS 里有、但本函数没接的（将来新增的动作）。
@@ -629,9 +648,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/healthz":
             return self._json(200, {"ok": True, "board": CFG["host"],
-                                    "llm": CFG["use_llm"]})
+                                    "llm": CFG["use_llm"],
+                                    "knowledge_page": PAGER.state()})
         if not self._host_ok():
             return self._json(403, {"error": "Host 头不合法（防 DNS rebinding）"})
+        if path == "/knowledge/page":
+            return self._json(200, PAGER.state())
 
         if path in ("/", "/index.html"):
             page = os.path.join(_HERE, "index.html")
@@ -1150,6 +1172,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except KeyboardInterrupt:
         print("\n[api] 停止")
     finally:
+        PAGER.close()
         srv.server_close()
     return 0
 

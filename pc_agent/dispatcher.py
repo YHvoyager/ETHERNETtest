@@ -345,6 +345,12 @@ def match_rules(text: str) -> RuleHit:
     s = text.strip()
     low = s.lower()
 
+    # ---- 本地学科知识库 ----
+    if ((re.search(r"信号与系统|信号系统|数字信号处理|大学物理|普通物理|物理学|机器人控制|机器人学数学|控制数学", low)
+            and re.search(r"什么|解释|讲|介绍|原理|公式|定义|区别|如何|怎么|知识|复习|要点|总结|问", low))
+            or re.search(r"(?:什么是|解释|讲讲|介绍一下|复习一下).*(采样定理|傅里叶|拉普拉斯|卷积|滤波器|雅可比|李雅普诺夫|热力学|电磁感应)", low)):
+        return _plan("knowledge", text, by="rule#knowledge", why="查询本地学科知识库")
+
     # ---- 屏幕电源：ON/OFF/CLR/FILL/INIT ----
     # ⚠ 排障类说法**不在这里**收口（放在下面屏幕命令之后）。踩过的坑：
     #   原先排障在最前面，把"屏幕没亮"整段抢走返回 OLED INIT，于是
@@ -577,7 +583,7 @@ DISPATCH_PROMPT = """你是一个指令分派器。把用户的一句话翻译�
             这是最常见的一条：能画的东西没有上限，别因为名字不在内置列表里就说做不到。
   cmd       给板子发一条命令，arg 是命令原文（全大写）
   query     查看状态，arg 只能是：%(query_cmds)s
-  knowledge 从知识库取内容（目前还没有知识库，arg 填科目名）
+  knowledge 从本地四科知识库取内容，arg 是用户的完整问题
   render    只渲染一帧看看效果，不发板子，arg 为 null
   led_blink 让板载 LED 闪几下（会真的发 LED 命令），arg 为对象：
             {"index": 0或1, "times": 次数, "period": 半周期秒数}
@@ -688,6 +694,14 @@ def _parse_llm_json(raw: str, text: str, log: List[str]) -> RuleHit:
         if action == "query" and arg.upper() not in QUERY_ONLY:
             log.append("校验失败：%r 不是只读查询命令" % arg)
             return None
+    if action == "knowledge" and not (isinstance(arg, str) and arg.strip()):
+        log.append("校验失败：knowledge 缺少问题文本")
+        return None
+    if action == "knowledge":
+        # 模型有时只返回科目名（例如“数字信号处理”），但检索需要保留
+        # 用户真正问的主题（例如“傅里叶变换是什么”）。用户原文是可信的
+        # 唯一完整问题，统一覆盖模型的简写 arg。
+        arg = text
     if action == "draw" and not (isinstance(arg, str) and arg.strip()):
         log.append("校验失败：draw 缺少画面描述")
         return None
@@ -1115,3 +1129,6 @@ if __name__ == "__main__":
     except (SandboxError, agent.LLMError) as e:
         print("\n[dispatcher] 出错：%s" % e, file=sys.stderr)
         sys.exit(2)
+
+
+

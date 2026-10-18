@@ -61,6 +61,7 @@ extern struct netif gnetif;
 
 /** 心跳间隔 */
 #define ECHO_BEAT_INTERVAL  1000U
+#define KEY_DEBOUNCE_MS     30U
 
 /* ------------------------------------------------------------------------- */
 /* 内部状态                                                                    */
@@ -82,6 +83,14 @@ static uint8_t   s_bcast_enabled = 0U;
 
 /** 心跳节流 */
 static uint32_t  s_last_beat_tick = 0U;
+
+/* 按键去抖状态：PA0 高有效，PH2 低有效（gpio.c 的上下拉配置）。 */
+static uint8_t   s_up_candidate = 0U;
+static uint8_t   s_up_stable = 0U;
+static uint32_t  s_up_changed_tick = 0U;
+static uint8_t   s_down_candidate = 0U;
+static uint8_t   s_down_stable = 0U;
+static uint32_t  s_down_changed_tick = 0U;
 
 /** 收包计数，方便肉眼确认"到底收到没有" */
 static uint32_t  s_rx_count = 0U;
@@ -620,8 +629,40 @@ int Echo_Service_SetBroadcast(const ip_addr_t *ip, uint16_t port)
 void Echo_Service_Poll(void)
 {
   int n;
+  uint32_t now = HAL_GetTick();
+  uint8_t up_pressed = (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET) ? 1U : 0U;
+  uint8_t down_pressed = (HAL_GPIO_ReadPin(GPIOH, GPIO_PIN_2) == GPIO_PIN_RESET) ? 1U : 0U;
 
-  /* 和 udp_echo.c 里一样：没有 peer 就不发，避免往 0.0.0.0 乱发。
+  /* 非阻塞去抖，只在按下边沿发送一次事件。即使还没有 peer 也更新状态，
+   * 这样建立连接后不会把一直按住的键误报成重复事件。 */
+  if (up_pressed != s_up_candidate)
+  {
+    s_up_candidate = up_pressed;
+    s_up_changed_tick = now;
+  }
+  else if ((up_pressed != s_up_stable) && ((now - s_up_changed_tick) >= KEY_DEBOUNCE_MS))
+  {
+    s_up_stable = up_pressed;
+    if (s_up_stable != 0U && s_have_peer != 0U && s_pcb != NULL)
+    {
+      (void)send_to_peer("KEY UP\n", 7U);
+    }
+  }
+  if (down_pressed != s_down_candidate)
+  {
+    s_down_candidate = down_pressed;
+    s_down_changed_tick = now;
+  }
+  else if ((down_pressed != s_down_stable) && ((now - s_down_changed_tick) >= KEY_DEBOUNCE_MS))
+  {
+    s_down_stable = down_pressed;
+    if (s_down_stable != 0U && s_have_peer != 0U && s_pcb != NULL)
+    {
+      (void)send_to_peer("KEY DOWN\n", 9U);
+    }
+  }
+
+  /* 和 udp_echo.c 里一样：没有 peer 就不发心跳，避免往 0.0.0.0 乱发。
    * 主动推心跳的理由见 udp_echo.c 的注释 —— 助手界面先出声，用户才好判断
    * 到底是"板子没收到"还是"回包被防火墙拦了"。 */
   if (s_have_peer == 0U || s_pcb == NULL)
@@ -629,7 +670,7 @@ void Echo_Service_Poll(void)
     return;
   }
 
-  if ((HAL_GetTick() - s_last_beat_tick) >= ECHO_BEAT_INTERVAL)
+  if ((now - s_last_beat_tick) >= ECHO_BEAT_INTERVAL)
   {
     s_last_beat_tick = HAL_GetTick();
 

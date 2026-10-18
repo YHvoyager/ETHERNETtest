@@ -40,6 +40,14 @@
 {"raw": "把灯1打开", "action": "cmd", "arg": "LED 1 1"}
 {"raw": "板子上的灯亮一下", "action": "cmd", "arg": "LED 0 1"}
 
+# ---- LED 闪烁：灯号和次数都是 0/1 开头的数字，极易串位 ----
+# 这两条都是 HTTP 层实测才暴露的真 bug，见 AGENTS.md §3.12.2。
+{"raw": "闪灯 10 次", "action": "led_blink", "arg": {"index": 0, "times": 10, "period": 0.2}}
+{"raw": "闪灯 1 次", "action": "led_blink", "arg": {"index": 0, "times": 1, "period": 0.2}}
+{"raw": "闪 DS1 3 次", "action": "led_blink", "arg": {"index": 1, "times": 3, "period": 0.2}}
+{"raw": "闪 LED1 4 次", "action": "led_blink", "arg": {"index": 1, "times": 4, "period": 0.2}}
+{"raw": "闪灯2次", "action": "led_blink", "arg": {"index": 0, "times": 2, "period": 0.2}}
+
 # ---- 探活 / 状态 ----
 {"raw": "ping", "action": "query", "arg": "PING"}
 {"raw": "在吗", "action": "query", "arg": "PING"}

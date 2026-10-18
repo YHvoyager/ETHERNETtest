@@ -260,8 +260,20 @@ LED_BLINK_MIN_PERIOD = 0.05
 
 def _led_blink_plan(low: str, text: str) -> Plan:
     """把"闪一下灯"翻译成**真正的 LED 命令序列**，而不是播动画。"""
-    m = re.search(r"(?:led|ds)\s*([01])|灯\s*([01])", low)
-    num = (m.group(1) or m.group(2)) if m else "0"
+    # ⚠ 只有**紧跟"灯"字的那个数字**有歧义：它可能是灯号，也可能是次数。
+    #   踩过两次，方向相反：
+    #     "闪灯 10 次"  → 只吃下 "1" 丢下 "0" → 误判 DS1（该是默认 DS0）
+    #     "闪灯 1 次"   → 吃下 "1"             → 误判 DS1（该是默认 DS0，闪 1 次）
+    #   判据：**灯号后面既不能跟数字，也不能跟量词**（次/下/遍/秒/毫秒）。
+    #
+    # ⚠ 而 "DS1" / "LED1" 是**明确的灯号声明**，后面的 "3 次" 是次数，
+    #   两个分支绝不能共用同一条排除规则 —— 我第一版就是这么写坏的：
+    #   "闪 DS1 3 次" 因为 1 后面跟了空格+3 而被整条否掉，退回默认 DS0。
+    #   所以：带 ds/led 前缀的直接认，裸"灯"才走歧义判断。
+    _AMBIG_TAIL = r"(?!\s*(?:\d|次|下|遍|秒|毫秒|ms))"
+    m = (re.search(r"(?:led|ds)\s*([01])(?!\d)", low)          # DS1 / LED1：明确
+         or re.search(r"灯\s*([01])" + _AMBIG_TAIL, low))       # 灯1 / 灯 1：要判
+    num = m.group(1) if m else "0"
 
     times = _LED_BLINK_DEFAULT_TIMES
     period = _LED_BLINK_DEFAULT_PERIOD

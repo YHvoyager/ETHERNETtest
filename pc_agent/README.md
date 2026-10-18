@@ -190,7 +190,80 @@ python pc_agent/agent.py --code ... # 或直接用内置的 text 动画
 | `bitmap.py` | 中文点阵渲染（Windows GDI） |
 | `sandbox.py` | 沙箱：import 白名单、名字白名单、超时 |
 | `agent.py` | 主程序：CLI、LLM 调用、播放循环、代码缓存 |
+| `dispatcher.py` | **说一句话 → 结构化指令**（规则层 + LLM 层 + 安全白名单），见下 |
+| `api.py` | 给前端用的 HTTP 外壳：两段式确认、一次性 token、长任务异步 |
+| `dispatch_cases.jsonl` | dispatcher 的验收标准（自测集，进版本库） |
 | `code_cache/` | LLM 写成功过的代码（自动生成） |
+
+---
+
+## 说一句话就能动：dispatcher
+
+`agent.py "描述"` 只负责**画**。要"把灯打开""闪灯三下""报一下板子状态"，
+用 `dispatcher.py` —— 它把自然语言翻译成**一条结构化指令**，然后（可选）执行。
+
+```bash
+python pc_agent/dispatcher.py "把灯打开"          # 写操作 → 停下要你确认，exit 3
+python pc_agent/dispatcher.py "把灯打开" -y       # 真发
+python pc_agent/dispatcher.py "在吗"              # 只读 → 直接执行
+python pc_agent/dispatcher.py "播烟花" --json     # 只要结构化结果，不执行
+python pc_agent/dispatcher.py "采样率" -x         # 解释为什么这样理解
+python pc_agent/dispatcher.py --test              # 跑自测集
+```
+
+分三层，越靠前越确定：
+
+```
+① 规则层   正则命中 → 结果确定、0 延迟、0 花费
+② LLM 层   规则未命中才问模型，temperature=0，只收严格 JSON
+③ 拒绝     两边都没把握 → 明确说不知道，绝不瞎猜
+```
+
+7 个 action：`cmd` / `query` / `anim` / `draw` / `render` / `knowledge` / `led_blink`。
+
+**安全靠三道闸**（缺一不可）：
+
+1. 命令必须在固件命令表里，寄存器地址必须在 GPIO 区间、**不能写 RCC**
+2. 写操作不加 `-y` 一律不执行
+3. 板子端 `reg_shell.c` 自己还有一道白名单
+
+> ⚠ 固件只认**数字**索引：`LED 0 1` 而不是 `LED DS0 1`（后者板子回
+> `ERR: bad LED index 'DS0'`）。
+
+每次分派记一行到 `dispatch_log.jsonl`（含 `by` 说明是规则命中的还是 LLM 猜的）。
+想加说法：往 `dispatch_cases.jsonl` 加一行，跑 `--test`，规则层必须 100% 过。
+
+---
+
+## 浏览器里说：api.py
+
+不想开终端时，`api.py` 把 dispatcher 包成一个本地 HTTP 服务：
+
+```bash
+python pc_agent/api.py              # http://127.0.0.1:8765
+python pc_agent/api.py --selftest   # 24 项自测（会真的点灯，需要板子在线）
+```
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/healthz` | 探活 |
+| GET | `/commands` | 列出 action / 固件命令 / 只读白名单 |
+| POST | `/dispatch` | 只翻译。**只读的直接执行**，写操作返回 `needs_confirm` + `token` |
+| POST | `/confirm` | 凭 token 执行。长任务返回 `202` + job id |
+| GET | `/job/<id>` | 轮询长任务进度 |
+
+**两段式确认怎么保证的**：服务端**不存待确认队列**。`/dispatch` 把
+`{原文, action, arg, 来源, 过期时间, nonce}` 用 HMAC-SHA256 签成一张票，
+`/confirm` 验签 + 验过期 + 验 nonce 没用过，三条全过才执行。
+
+> 票里**没有** `needs_confirm` 字段 —— 验票时用 dispatcher 的判据**重新算**。
+> 安全结论不能由票自己声明，否则改一下 payload 就能把写操作说成只读。
+
+密钥在 `pc_agent/.api_key`（首次运行生成，**已 gitignore**）。
+
+> ⚠ 默认只听 `127.0.0.1`，并且除 `/healthz` 外校 Host 头 —— 挡住的是
+> "你浏览器里某个网页偷偷往 localhost 发请求"。**这不是认证**，别拿它暴露公网。
+
 
 ---
 

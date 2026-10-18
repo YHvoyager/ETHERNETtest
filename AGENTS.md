@@ -728,6 +728,97 @@ python pc_agent/dispatcher.py --test            # 跑自测集
 > 所以 API key 的读取逻辑只有一份。改 LLM 配置只需要改 `agent.py`。
 
 
+### 3.12.2 `pc_agent/api.py` —— HTTP 外壳 + 两段式确认（阶段二）
+
+**它要解决的问题**：`dispatcher.py` 在命令行里每次都是新进程，`--yes` 一个标志
+就把"翻译"和"执行"一次说完了。前端要的是**两次独立请求**中间的确认，以及
+"闪 50 次灯"这种 20 秒任务不把服务卡死。
+
+**接口**（`python pc_agent/api.py` 默认 `http://127.0.0.1:8765`）：
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/healthz` | 探活，**不做 Host 校验**（给监控用） |
+| GET | `/commands` | 列出 action / 固件命令表 / 只读白名单 |
+| POST | `/dispatch` | `{"text": "..."}` → 只翻译。只读的**直接执行**；写操作返回 `status=needs_confirm` + `token` + `preview`，**不执行** |
+| POST | `/confirm` | `{"token": "..."}` → 验票后执行。`led_blink` 或带 `async:true` 返回 `202` + `job` |
+| GET | `/job/<id>` | 轮询长任务：`state` / `progress` / `notes` / `result` |
+
+**status 取值只有四个**：`done` / `needs_confirm` / `refused` / `error`
+（`/job` 的是 `running` / `done` / `error`）。前端按这个分派 UI 分支。
+
+**一次性 token 怎么做的（核心设计）**：
+
+```
+payload = {raw, action, arg, sub, by, why, nonce, exp}
+token   = base64url(JSON(payload)) + "." + base64url(HMAC-SHA256(KEY, body))
+```
+
+- **服务端不存待确认队列**。验签 + 验过期 + 验 nonce 没用过，三条全过才执行。
+  好处：重启不丢、多进程不会状态不一致、不存在"忘了清队列导致旧指令被点火"。
+- `KEY` 在 `pc_agent/.api_key`（首次运行自动生成 32 字节随机，**已 gitignore**）。
+  刻意不走环境变量/命令行 —— 那会出现在进程列表里。
+- `TOKEN_TTL = 120` 秒。
+- `NonceStore` 只防"同一个 token 点两次"（防手滑），不是防攻击者。
+
+> ⚠ **token 里刻意没有 `needs_confirm` 字段**。验票时用
+> `dispatcher.needs_confirm()` **重新算**。安全判据不能由票自己声明 ——
+> 否则改一下 payload 就能把写操作说成只读。同理 `run_plan()` 在发给板子之前
+> 还会再调一次 `dispatcher.validate_cmd()`：HTTP 是外部输入，不信票。
+
+**为什么 `api.py` 不直接调 `dispatcher.execute()`**：它用 `print()` 输出、
+只返回退出码，拿不到回包正文。所以另写 `run_plan()` 负责"发出去、收回来"，
+但**判据全部来自 dispatcher**，一行策略都没有复制。自测集测的仍是同一份逻辑。
+
+**为什么长任务异步**：`led_blink` 闪 50 次要 20 秒。同步 HTTP 的话这 20 秒
+服务不响应。所以 `202` + `job_id`，前端轮询。实测：闪灯 10 次（约 2 秒）
+运行期间发"在吗"，**12ms 返回 PONG**。
+
+**两道网络防护**：
+
+1. **默认只听 `127.0.0.1`**。板子在 192.168.1.30，PC 在 192.168.1.100；
+   监听 `0.0.0.0` 等于同一网段任何人打开浏览器就能点你的灯。要用局域网就显式
+   `--host 0.0.0.0`（启动时会打印警告）。
+2. **Host 头校验**。只看 127.0.0.1 挡不住恶意网页 —— 你浏览器里的网页可以往
+   127.0.0.1 发请求（DNS rebinding）。所以除 `/healthz` 外，Host 不是
+   `localhost`/`127.0.0.1` 一律 403。实测 `Host: evil.example.com` → 403。
+
+> ⚠ **这两个都是"够用"级别的防护，不是认证**。真要暴露公网，前面必须加
+> 反向代理 + 密码。见 §11 待办。
+
+**自测**（`python pc_agent/api.py --selftest`，24 项，不需要浏览器）：
+
+覆盖 token 验签/改签/过期/复用、Host 头拒绝、只读直执行、写操作只发票、
+RCC 写被拒、闲聊被拒、长任务进度与 `sent` 序列、多路并发、坏输入。
+**自测会真的操作板子**（点灯、闪灯），前提是板子在线。
+
+> ⚠ 该自测在 **GBK 控制台**下曾崩溃：`UnicodeEncodeError: 'gbk' codec can't
+> encode character '\u2717'`。已把输出里的符号换成 ASCII 的
+> `[FAIL]`/`[PASS]`。**给 CLI 加符号前先想清楚控制台编码。**
+
+**日志**：`/dispatch` 每翻译一次记一行（`executed:false`），
+`/confirm` 执行后再记一行（`executed:true`）。执行那行的 `by` 是
+`confirm<rule#led>` 这种形式 —— 前缀表示"确实确认执行过"，尖括号里保留
+**原始来源**，这样查日志仍然看得出这条是规则翻译的还是 LLM 猜的。
+
+> ⚠ 曾经执行时把 `by` 直接写成 `"confirm"`，把来源覆盖掉了 ——
+> 而"能追到是谁翻译的"正是这份日志存在的唯一理由。已修。
+
+**两个 HTTP 层才暴露的规则层 bug（都已修，用例已进自测集）**：
+
+| 说法 | 错在哪 | 修法 |
+|---|---|---|
+| `闪灯 10 次` | 灯号正则 `灯\s*([01])` 贪婪只吃下 `1`、丢下 `0` → 误判 DS1，用户没说灯号却闪了另一盏 | 裸"灯"后的数字后面**不能跟数字或量词**（次/下/遍/秒/毫秒） |
+| `闪灯 1 次` | 同一个歧义的另一面：那个 `1` 是**次数**不是灯号 | 同上一条修好后自然正确 |
+
+> ⚠ 修第一条时我第一版把排除规则**两个分支共用**，结果 `闪 DS1 3 次`
+> 因为 `1` 后面跟着 `3` 被整条否掉、退回 DS0。**`DS1`/`LED1` 是明确的灯号
+> 声明，不该受裸"灯"那套歧义判断约束。** 两个分支必须分开写。
+
+**为什么这两个 bug 拖到 HTTP 层才发现**：自测集原来没有 led_blink 的用例，
+而命令行手工验证时恰好没试过"灯+个位数"。**手工验证覆盖不到的组合会一直在。**
+
+
 ### 3.13 ⚠ float 坐标会让 Bresenham 死循环（PC 端，踩过一次）
 
 **现象**：`python pc_agent\\agent.py "..."` 报
@@ -1006,7 +1097,8 @@ ping 192.168.1.30
 CubeMX/IDE 临时文件（`mx.scratch`/`*.ioc.bak`/`.cproject`/`.project`）、
 clangd `.cache/`、`__pycache__/`、OS 垃圾文件，以及 **`pc_agent/dispatch_log.jsonl`**
 （dispatcher 的运行日志，随调试无限增长；对应的自测集 `pc_agent/dispatch_cases.jsonl`
-是验收标准，**必须保留**）。
+是验收标准，**必须保留**）和 **`pc_agent/.api_key`**（`api.py` 给一次性确认票
+签名的密钥，首次运行自动生成；进版本库等于公开私钥）。
 
 **白名单（`!` 强制保留，不会被误伤）**：`.settings/*.json`、`.vscode/settings.json`、
 `.vscode/c_cpp_properties.json`、`CMakePresets.json`、`CMakeLists.txt`、`cmake/*.cmake`、
@@ -1052,6 +1144,81 @@ clangd `.cache/`、`__pycache__/`、OS 垃圾文件，以及 **`pc_agent/dispatc
 ## 10. 变更日志
 
 > **每次改动代码后在此追加一条，最新的在最上面。**
+
+### 2026-02-13 — 阶段二：`api.py`（HTTP 外壳 + 两段式确认 + 一次性票）
+
+阶段一的 dispatcher 只能在命令行跑，`--yes` 一个标志就把"翻译"和"执行"
+一次说完了。用户要的是**前端上"我先看到它理解成什么，再点确认"**，
+所以本批把 dispatcher 包成 HTTP，并把确认拆成两次独立请求。
+
+**新增 `pc_agent/api.py`**（不新增第三方依赖，`http.server` + `hmac`）：
+
+1. **五条路由**：`/healthz`、`/commands`、`/dispatch`、`/confirm`、`/job/<id>`。
+   `/dispatch` **只翻译**：只读的顺手执行，写操作返回 `needs_confirm` +
+   `preview` + `token`，**一个字节都不发给板子**。
+
+2. **一次性 token 用 HMAC 签，服务端不存队列**：
+   `base64url(payload) + "." + base64url(HMAC-SHA256(key, payload))`，
+   payload 含 `raw/action/arg/sub/by/why/nonce/exp`。验签 + 验过期（`TOKEN_TTL=120`）
+   + 验 nonce 未用过，三条全过才执行。
+
+   > **为什么不存待确认队列**：存队列就有"重启丢一半""多进程状态不一致"
+   > "忘了清理导致三天前的指令被点火"。无状态签名票把这些问题全部消掉。
+
+   > ⚠ **票里刻意不放 `needs_confirm`**，验票时用 `dispatcher.needs_confirm()`
+   > **重算**；`run_plan()` 在执行前还会再调一次 `dispatcher.validate_cmd()`。
+   > **安全结论不能由被检查的对象自己声明。**
+
+3. **判据全部复用 `dispatcher.py`，一行策略都没复制**。`api.py` 自己只写
+   `run_plan()`（发出去、收回来，因为 `dispatcher.execute()` 只 print + 返回退出码，
+   拿不到回包正文）。所以 `--test` 测的仍是同一份逻辑。
+
+4. **长任务异步**：`led_blink` 闪 50 次要 20 秒，同步 HTTP 会把这 20 秒
+   服务全占住。改为 `202` + `job_id` + 进度轮询。实测闪灯 10 次期间
+   并发发"在吗"，**12ms 返回 PONG**。
+
+5. **两道网络防护**：默认只听 `127.0.0.1`；除 `/healthz` 外校验 Host 头
+   （挡 DNS rebinding —— 你浏览器里的网页能往 localhost 发请求）。
+   实测 `Host: evil.example.com` → `403`。
+   **这是"够用"级，不是认证。**
+
+6. **`--selftest` 24 项**，覆盖：token 验签/改签/过期/复用、Host 拒绝、
+   只读直执行、写操作只发票、RCC 写被拒、闲聊被拒、长任务进度与 `sent` 序列、
+   并发、坏输入。**24/24 通过**（真板子在线）。
+
+**同时修掉的三个真 bug**：
+
+7. **规则层 `闪灯 10 次` 误判灯号**（HTTP 层第一次真实使用才暴露）。
+   `灯\s*([01])` 贪婪只吃下 `1`，剩个 `0` → 判成 DS1，用户没说灯号却闪了
+   另一盏灯；`闪灯 1 次` 里那个 `1` 是次数，被当成灯号。
+   修法：裸"灯"后面的数字**后面不能跟数字或量词**（次/下/遍/秒/毫秒）。
+
+   > ⚠ 第一版把排除规则**两个分支共用**，把 `闪 DS1 3 次` 也否掉了
+   > （`1` 后面跟着 `3`），退回 DS0。**`DS1`/`LED1` 是明确的灯号声明，
+   > 不能受裸"灯"的歧义判断约束** —— 两个分支必须分开写。
+
+8. **`--selftest` 在 GBK 控制台崩溃**：`UnicodeEncodeError: 'gbk' codec can't
+   encode character '\u2717'`。CLI 输出里的 `✗`/`✅` 全部换成 ASCII 的
+   `[FAIL]`/`[PASS]`。**给 CLI 加符号前先想控制台编码。**
+
+9. **执行那行日志把来源覆盖掉了**：`/confirm` 原本把 `by` 写成 `"confirm"`，
+   于是"这条是规则翻译的还是 LLM 猜的"查不出来了 —— 而这正是日志存在的
+   唯一理由。改为 `confirm<rule#led>`：前缀说明确认执行过，尖括号保留原始来源。
+
+**其它**：
+
+10. `.gitignore` 新增 `pc_agent/.api_key`（签名密钥，进库等于公开私钥）。
+    验证：`git check-ignore -v` 命中 `.gitignore:148`，
+    `git ls-files -i -c --exclude-standard` 仍为空。
+11. `pc_agent/README.md` 补 dispatcher / api.py 两节（把 `文件说明` 表补全）。
+
+**验证**：`dispatcher.py --test` → **79/79（53 条用例）**；
+`api.py --selftest` → **24/24**；真机端到端跑通 `/dispatch` → 改票被拒 →
+`/confirm` 执行 → `/job` 轮询完成。
+
+**为什么不直接改 `dispatcher.py` 加 HTTP**：dispatcher 的价值是"纯翻译 +
+确定性自测集"，掺进 socket 和 token 之后 `--test` 就不纯了。多一个薄壳
+`api.py`，多一层可单独自测的东西。
 
 ### 2026-02-13 — `dispatcher.py` 新增 `led_blink`：真的会闪灯的动作
 

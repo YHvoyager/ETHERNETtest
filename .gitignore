@@ -139,6 +139,9 @@ eyes_preview.png
 *_preview.png
 car*.txt
 ascii_*.txt
+# dispatcher 的运行日志：每次分派一行，随本机调试不断增长，
+# 属于运行产物而不是源码。自测集 dispatch_cases.jsonl 则必须进版本库。
+pc_agent/dispatch_log.jsonl
 
 # ============================================================
 # 强制保留（即使被上面的规则匹配，也要纳入版本控制）

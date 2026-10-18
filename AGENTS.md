@@ -628,6 +628,106 @@ bit  = y & 7          // bit0 在最上面
 | **沙箱注入辅助函数，不放行 `import bitmap`** | 放行会把 gdi32/ctypes 暴露进沙箱，且 GDI 句柄有进程级上限，子线程反复进出不安全。注入一个绑好的 `draw_text()` 既给了能力又没开新面 |
 | **辅助函数起名 `draw_text` 而不是 `text`** | LLM 会把 `text` 当普通名词当变量名（缓存里真出现过 `text = "NI HAO"`），一旦局部变量遮蔽了注入的全局函数，调用时报 `'str' object is not callable`。动词开头不会被这么用 |
 
+### 3.12.1 `pc_agent/dispatcher.py` —— 一句话 → 结构化指令（阶段一）
+
+用户输入**自然语言**（"把灯打开"、"播个烟花"、"屏幕上一个字都没了"），
+dispatcher 负责翻译成一条**结构化指令**，然后（可选）执行。
+
+**它只翻译 + 执行，不画图。** 画图/动画交给 `agent.py`，二者边界清晰。
+
+```
+dispatcher.py "把灯打开"
+   ↓
+{"action":"cmd", "arg":"LED 0 1", "by":"rule#led", "needs_confirm":true}
+   ↓  没有 --yes → 停下，exit 3
+```
+
+**6 个闭合 action**（`ACTIONS`，不许多）：
+
+| action | 含义 | `arg` 是什么 |
+|---|---|---|
+| `cmd` | 给板子发一条固件命令 | 命令字符串，如 `LED 0 1` |
+| `query` | 只读探测（PING/INFO/FB?/HELP/OLED STAT） | 命令字符串 |
+| `anim` | 播内置动画 | 动画名（`anim.ANIMS` 里的） |
+| `draw` | 让 LLM 现写代码画新动画 | 画面描述 |
+| `render` | 只渲染发 PNG，**不发板子** | `None` |
+| `knowledge` | 输出知识类内容 | 文本 |
+
+**三层决策，越靠前越确定**：
+
+```
+① 规则层 match_rules()   正则命中 → 直接出结果（确定性，自测集必须 100% 过）
+② LLM 层 ask_llm_for_plan()  未命中才问，temperature=0，只要严格 JSON
+③ 拒绝                    两边都没把握 → action=None + why，**绝不瞎猜**
+```
+
+**自测集 `pc_agent/dispatch_cases.jsonl`**（53 条，一行一例）：
+
+```jsonl
+{"raw": "把灯打开", "action": "cmd", "arg": "LED 0 1"}
+{"raw": "下雨", "action": null}            # 裸名词该拒绝，不是播雨动画
+```
+
+`python dispatcher.py --test` 跑它。规则层必须 **100%** 通过（确定性代码，
+过不了就是规则写错了），另有若干条"规则层未命中"是**故意**留给 LLM 的。
+**加新说法 → 加一行 → 跑 --test**，这是本文档最短的改动闭环。
+
+**安全模型（三层，缺一不可）**：
+
+| 层 | 函数 | 作用 |
+|---|---|---|
+| ① 命令白名单 | `validate_cmd()` | 命令必须在 `FIRMWARE_CMDS` 里（对应 `reg_shell.c` 的 `s_help_text`），寄存器地址必须在 GPIO 区间且**不能落在 RCC 只读区** |
+| ② 写操作确认 | `needs_confirm()` | 写操作不加 `--yes` 一律不执行，exit 3 |
+| ③ 板子端 | `reg_shell.c` | 固件自己还有一道白名单（§3.7） |
+
+> ⚠ **`needs_confirm()` 的判据故意反过来**：只证明是只读的才免确认，其余全要。
+> 写成 `if cmd in WRITE_CMDS: return True` 的话，将来固件加一条新命令，
+> 它不在 `WRITE_CMDS` 里 → 被当只读 → 悄悄打到板子。反过来判，
+> 新命令默认要确认，宁可多点一次。
+
+> ⚠ **命令头只读 ≠ 这条命令只读**。`IO`（不带参数）是列状态，`IO 1 1` 是写引脚；
+> `OLED` 是屏幕示意，`OLED CLR` 是写。所以 LED/IO/OLED 三个分支必须**看参数**。
+> 早先写成 `if head in READONLY_CMDS: return False`，"IO 1 1" 因为头是 IO
+> 被判只读，**不加 --yes 直接写进了板子**。
+
+**为什么规则层要覆盖常见说法**：每条规则命中的请求都是 0 延迟、0 花费、
+结果确定。只有规则接不住的才值得掉到 LLM 那层（有网络、有延迟、结果不保证）。
+
+**几条踩过的语言陷阱**（写新规则前先看这个）：
+
+| 陷阱 | 例子 | 处理 |
+|---|---|---|
+| 中文名词夹在别的词里 | "我在**汽车**站"、"我**马上**回来" | 动画词必须配**排除词**：`车(?!站)`、`马(?!上)`；且**裸名词不认**，要带"播/放/来个"这类动词 |
+| 述宾方向搞反 | `没.{0,4}字` 对 "屏幕上一个字都**没了**" 永远不命中 | 两个方向都写：`没.{0,4}字\|字.{0,4}没` |
+| 动词正则吞掉别的领域 | `(开\|亮)(屏幕\|屏)?` 里的 `(屏幕\|屏)?` 是**可选**的，等于裸"打开"也算开屏 → "把灯打开"被判成 OLED ON | 判"屏"必须要求"屏"字真的出现，且和动词紧挨 |
+| 参数被丢掉 | "播眼睛 5 秒" → 只认出 anim=eyes，5 秒没了 | 规则层顺便抽 `([\d.]+)\s*秒` / `([\d.]+)\s*倍速` 塞进 extra |
+
+**实测踩到的固件不匹配**：`LED DS0 1` 会让板子回
+`ERR: bad LED index 'DS0'` —— 实际固件只认**数字索引**，要发 `LED 0 1`
+（源码 `Core/Src/reg_shell.c` 里 LED 走 `parse_dec`）。
+`DS0` 只有紧凑写法 `DS0`（命令头）才认。dispatcher 里发的是 `LED 0 1`。
+
+**日志**：`pc_agent/dispatch_log.jsonl`，一行一次分派，含 `by`（命中哪条规则，
+或 `llm`）、`needs_confirm`、`executed`、`why`。分析"哪些说法总掉到 LLM"
+就从这里 grep。
+
+**CLI**：
+
+```bash
+python pc_agent/dispatcher.py "把灯打开"        # 写操作 → 提示加 --yes，exit 3
+python pc_agent/dispatcher.py "把灯打开" -y     # 真发
+python pc_agent/dispatcher.py "在吗"            # 只读 → 直接执行
+python pc_agent/dispatcher.py "播烟花" --json   # 只要结构化结果，不执行
+python pc_agent/dispatcher.py "采样率" -x       # 解释为什么这样理解
+python pc_agent/dispatcher.py --test            # 跑自测集
+```
+
+退出码：`0` 成功 / `1` 板子没回包或自测失败 / `2` 无法分派 / `3` 写操作待确认。
+
+> ⚠ `dispatcher.py` 与 `agent.py` **共用** `_llm_config()` / `_chat_url()`，
+> 所以 API key 的读取逻辑只有一份。改 LLM 配置只需要改 `agent.py`。
+
+
 ### 3.13 ⚠ float 坐标会让 Bresenham 死循环（PC 端，踩过一次）
 
 **现象**：`python pc_agent\\agent.py "..."` 报
@@ -891,6 +991,7 @@ ping 192.168.1.30
 | **串口没有 `[CMD]` 日志** | `echo_service.c` 分发没接上 | 检查回调里的前缀判断（见 §3.8） |
 | **OLED 全黑，串口却无任何报错** | 波特律动驱动吞掉 HAL 错误 | `OLED_Send()` 返回 void。先发 `OLED INIT`，再发 `OLED RAW 00 AF` 判握手（见 §7.5） |
 | **`OLED SCAN` 报 `not found` 但屏其实能点亮** | 扫描用 `HAL_I2C_IsDeviceReady` 探测，**该函数不可靠** | 别信扫描结果，直接发 `OLED TXT 0 TEST` 看屏。实测扫描曾漏报 0x3C 而屏是可点亮的 |
+| **串口助手一个字都收不到，波特率设置却是对的** | ① 串口被别的进程独占（UE4/编辑器插件/第二个助手实例）② 烧的是旧 hex ③ 串口线/地线 | 先按 §13.1 三连测：关独占进程 → 重新 objcopy 比时间戳 → 换 COM 号裸开一次（见 §13） |
 | **串口日志停在 `[PCF] eth_reset released` 就没了** | CubeMX 重新生成把 `USER CODE` 区外的代码删了 | `git diff` 看 `main.c`；手写代码必须放进 `USER CODE BEGIN/END` 配对里（见 §3.4 注） |
 | **CubeMX 重新生成后网口又不通** | `ethernetif.c` 的 5 处手工改动被还原 | 按 §3.4 逐条重做；MAC 变回 `00:80:E1:00:00:00` 或丢了 `HAL_ETH_Start()` 都是它 |
 
@@ -903,7 +1004,9 @@ ping 192.168.1.30
 已忽略：`build*/`、CMake 生成物（`CMakeCache.txt`/`CMakeFiles/`/`compile_commands.json`/
 `.ninja_log`/`build.ninja` 等）、编译产物（`*.o`/`*.d`/`*.su`/`*.elf`/`*.bin`/`*.hex`/`*.map`/`*.a`）、
 CubeMX/IDE 临时文件（`mx.scratch`/`*.ioc.bak`/`.cproject`/`.project`）、
-clangd `.cache/`、`__pycache__/`、OS 垃圾文件。
+clangd `.cache/`、`__pycache__/`、OS 垃圾文件，以及 **`pc_agent/dispatch_log.jsonl`**
+（dispatcher 的运行日志，随调试无限增长；对应的自测集 `pc_agent/dispatch_cases.jsonl`
+是验收标准，**必须保留**）。
 
 **白名单（`!` 强制保留，不会被误伤）**：`.settings/*.json`、`.vscode/settings.json`、
 `.vscode/c_cpp_properties.json`、`CMakePresets.json`、`CMakeLists.txt`、`cmake/*.cmake`、
@@ -949,6 +1052,119 @@ clangd `.cache/`、`__pycache__/`、OS 垃圾文件。
 ## 10. 变更日志
 
 > **每次改动代码后在此追加一条，最新的在最上面。**
+
+### 2026-02-13 — `dispatcher.py` 新增 `led_blink`：真的会闪灯的动作
+
+**问题**（用户现场，m00507）：
+
+```
+python pc_agent/dispatcher.py "在吗，在就闪灯"
+  理解：anim eyes   来源：rule#led   只读
+[dispatcher] anim 的执行器还没接
+```
+
+两个毛病一起暴露：① "闪灯" 被规则层错认成 `anim eyes`（当时没有闪灯动作，
+只好回退成播眼睛动画并加一条 warn）；② `anim` 的执行器根本没接，
+所以哪怕认对了也只会打印一行"还没接"。
+
+**修法**：新增第 7 个 action **`led_blink`**，`arg` 是对象
+`{"index": 0|1, "times": 次数, "period": 半周期秒数}`。
+
+> **为什么它是唯一的多条命令动作**：`ACTIONS` 里其余 6 个都是"**一条**指令"
+> （cmd/query 一条固件命令，anim/draw/render 一次播放/渲染，knowledge 一个字段）。
+> 而固件里**没有"闪灯"这条命令**，闪烁只能是 PC 端按时间反复发 `LED n 1` / `LED n 0`。
+> 硬塞进 `cmd` 会让 `arg` 变成"命令列表"，整个执行层都要跟着改；
+> 单开一个 action 反而是最小改动，而且语义清楚。
+
+**执行器 `_exec_led_blink()` 的三个设计点**：
+
+1. **在同一个 `Board` with 块里循环**。每次 `Board(...)` 都新建 socket + bind
+   临时端口，5 次闪就是 10 个 socket。
+2. **`finally` 里必须补一条 `LED n 0`**。中途 Ctrl+C 或板子掉线也要把灯恢复成灭。
+3. **结束回到灭是"幂等"设计**：闪完停在亮，用户下次看灯分不清"这是闪完留下的
+   状态"还是"本来就这样"。执行前后板子状态一样，才敢随便重放。
+
+**参数上限**（防止一句话占住板子几十秒）：`LED_BLINK_MAX_TIMES = 50`、
+`LED_BLINK_MIN_PERIOD = 0.05` 秒、`period` 上限 2 秒。默认 5 次 / 200ms。
+"闪2秒"这种**只说时长不说次数**的，按 `次数 = 时长 / (2×半周期)` 折算。
+
+**又抓到一个只在真实路径上炸的 bug**：`_is_reg_write()` 里
+`(plan.get("arg") or "").strip()` 遇到 `led_blink` 的 **dict** 参数直接
+`AttributeError: 'dict' object has no attribute 'strip'`。
+`--json` 分支走不到它、自测集也不构造带 dict 的 plan，所以**两套测试全绿，
+只有手工敲一次命令才炸**。教训：`--json` 能过不代表人类路径能过。
+
+**真机验证**（`--yes`，板子在线）：
+
+```
+[dispatcher] → 闪 DS0 5 次，间隔 200ms（共 10 条命令，约 2.0 秒）
+  1/5  OK IO 0 (DS0) = ON      ...  4/5  OK IO 0 (DS0) = OFF
+[dispatcher] ✅ 闪完了，灯已恢复成灭
+```
+
+**回归**：自测集 53 条 → 规则层 **79/79**（新增 4 条闪灯用例 + 安全断言）；
+`在吗` 仍判 `query PING` 只读直接执行；`W 40023800 0` 仍被分派器自己拒掉。
+
+同步更新 AGENTS.md §3.12.1（action 表 + 闪灯小节）与本节。**固件侧无改动。**
+
+**`.gitignore` 新增 `pc_agent/dispatch_log.jsonl`**（见 §9.1）。它是每次分派追加一行的
+运行日志，随本机调试无限增长，属于运行产物；而自测集 `dispatch_cases.jsonl`
+是手工维护的验收标准，**必须进版本库**。两者只差一个词，别一起忽略。
+
+
+### 2026-02-13 — 新增 `pc_agent/dispatcher.py`：一句话 → 结构化指令（阶段一）
+
+**做了什么**：用户要"代码简洁的同时功能强大"，于是把"自然语言 → 板子指令"
+这一层从 `agent.py` 里拆出来，单独成 `pc_agent/dispatcher.py`（约 820 行 +
+53 条自测集）。`agent.py` 只管画画，dispatcher 只管理解，两者边界清晰。
+
+**新增文件**：
+
+| 文件 | 说明 |
+|---|---|
+| `pc_agent/dispatcher.py` | 规则层 + LLM 层 + 执行层；6 个闭合 action |
+| `pc_agent/dispatch_cases.jsonl` | 53 条自测集（验收标准），规则层必须 100% 过 |
+| `pc_agent/dispatch_log.jsonl` | 运行日志（每次分派一行） |
+
+**真机验证**（板子 `192.168.1.30:8080` 在线，全部实打实跑过）：
+`PING` → `PONG tick=...`；`INFO` → `board 192.168.1.30  tick=... io_count=2`；
+`LED 0 1` / `LED 0 0` → `OK IO 0 (DS0) = ON/OFF`；
+`OLED ON` → `OK display on`；`OLED CLR` → `OK OLED cleared`；
+`FB?` → `FB: good=... bad=0 ooo=... resync=...`；
+`OLED STAT` → `OLED flush: busy=0 dropped=1`。
+
+**开发中抓到的五个真 bug**（都是自测集或真机当场发现的，记录以防回退）：
+
+1. **⚠ `needs_confirm` 被绕过（安全）**：规则层 `_plan("cmd", ...)` 默认
+   `needs_confirm_=False`，而 `dispatch()` 只在某个分支里补算 → **"把灯打开"
+   被判成只读，不加 `--yes` 就直接打到了板子**。修法：新增 `_finalize(hit, text)`，
+   对**每一条** cmd/query 统一重算 `needs_confirm`，规则层和 LLM 层共用；
+   `run_tests` 同时加入安全断言（每条 cmd 的 `needs_confirm` 必须等于独立重算的结果）。
+   自测计数因此从 39/39 变 **69/69**。
+2. **命令头只读 ≠ 命令只读**：`if head in READONLY_CMDS: return False` 让
+   `IO 1 1`（真在写引脚）被判只读。拆成四段：OLED 看子命令 / LED·IO 看有没有"值" /
+   其余查白名单。附带修掉一个隐藏崩溃：旧代码 `tok[2]` 在 `"IO 0"`（2 token）上
+   会 `IndexError`，而 **`IndexError` 不是 `Exception` 的子类**，会让整个进程崩掉。
+3. **`WB` 的字节上限校验是死代码**：它写在 `return ... GPIO 区间` 之后，
+   只有落到 `return "不在白名单"` 才可能被执行 —— 等于对合法地址永不检查，
+   `WB 40020014 1FF` 会原样打到板子。已移到读取 `val` 之后、区间判断之前。
+4. **`_TROUBLE_RE` 正则方向搞反**：`没.{0,4}字` 对"屏幕上一个字都**没了**"
+   永远不命中（中文述宾语序里"字"在前）。两个方向都写才覆盖。
+5. **开屏正则吞掉所有"打开"**：先写成 `(开|亮|点亮|打开).{0,3}屏`，
+   "板子上的灯亮一下"会被误判；改成 `(开|亮|…)(屏幕|屏)?` 更糟 ——
+   `(屏幕|屏)?` 是**可选**的，等于裸"打开"也算开屏，**"把灯打开"全被判成 OLED ON**。
+   最终要求"屏"字必须真的出现且和动词紧挨。这两次都是**自测集当场抓到的**。
+
+**固件不匹配（实测）**：`LED DS0 1` 会让板子回 `ERR: bad LED index 'DS0'` ——
+固件只认**数字索引**（`Core/Src/reg_shell.c` 里 LED 走 `parse_dec`），
+dispatcher 发的是 `LED 0 1`。
+
+**离线降级验证**：把 `OLED_AGENT_BASE_URL` 指向 `http://127.0.0.1:9`，
+LLM 层报 `URLError: <urlopen error [WinError 10061] 由于目标计算机积极拒绝...>`，
+程序不崩、正常给出拒绝原因。
+
+同步更新 AGENTS.md 新增 §3.12.1 与本节变更日志。**固件侧无任何改动。**
+
 
 ### 2026-02-13 — 帧率修复 + FBSEQ 时间判据 + 链路检测搬迁 + 中文/float 坐标
 
@@ -1591,3 +1807,47 @@ GPIOA~GPIOK（`0x40020000`~`0x40023FFF`）与 RCC（`0x40023800`~`0x40023BFF`，
 11. **PC 端绘图原语的坐标必须能是 float —— 入口一律 `_iv()` 强转**（见 §3.13）
 12. **FBSEQ 判重只在同一会话内生效，会话由 500ms 时间间隔切分**（见 §3.11）
 13. **诊断脚手架不该改变被测系统的行为**（`settrace` 的教训，见 §3.13）
+14. **写操作确认的判据要反过来写**：只证明是只读的才免确认，其余全要（见 §3.12.1）
+15. **规则层加说法 → 在 `dispatch_cases.jsonl` 加一行 → 跑 `--test`**（见 §3.12.1）
+
+---
+
+## 13. 串口助手收不到任何打印（现场诊断）
+
+> 触发场景：串口助手一个字都收不到，但波特率 115200-8-N-1 设置是对的。
+> **先确认这是不是板子的问题** —— 绝大多数情况不是。
+
+### 13.1 三连测（按顺序做，前一步不过不要往下）
+
+| # | 测什么 | 怎么做 | 判据 |
+|---|---|---|---|
+| 1 | **串口是否被独占** | 关掉所有可能占用 COM 口的东西（UE4、编辑器串口插件、第二个串口助手实例、Arduino IDE 等），然后单独开一次助手 | 端口能打开。若报 `Access to the path 'COM22' is denied.` / `打开串口失败`，就是被独占 |
+| 2 | **烧的是不是旧 hex** | 比时间戳：源文件 `Core/Src/main.c` vs `build/Debug/ETHERNETtest.hex` | **hex 必须比所有源文件新**。不新就重新 `objcopy`（见 §2.3） |
+| 3 | **换 COM 号裸开一次** | 设备管理器里看 CH340 的**真实** COM 号（USB-SERIAL CH340；曾出现注册表残留 COM22 而实际设备名是 `USB-SERIAL CH340 (COM11)`），用另一个助手或裸串口工具打开它 | 能看到乱码或正常文本。一个字节都看不到 → 查线和地 |
+
+> **踩过的坑**：`HKLM\HARDWARE\DEVICEMAP\SERIALCOMM` 里可能残留
+> `\Device\USBSER000=COM22`，而 CH340 的 `FriendlyName` 实际写的是 `COM11`。
+> **以设备管理器的 FriendlyName 为准，不要信注册表里的旧映射。**
+
+### 13.2 代码链路本身（基本可以排除）
+
+已核对过，printf 重定向这条链**没有缺陷**：
+`printf` → `iprintf` → `_vfiprintf_r` → `__sfvwrite_r` → `_write`
+（`Core/Src/debug_uart.c:29`，强符号，链接器选中它，`syscalls.c` 里的弱版被丢弃）
+→ `HAL_UART_Transmit(&huart1, ...)`。`HAL_UART_MspInit` 的反汇编里
+AF7 / PA9 / PA10 / GPIOA 时钟 / USART1 时钟全部正确。
+
+> 唯一的小瑕疵：`Core/Inc/debug_uart.h:23` 声明了 `__io_putchar` 但
+> `debug_uart.c` 没有包含这个头文件（`-Wmissing-prototypes` 隐患）。
+> nano printf 路径不经 `__io_putchar`，所以它**不会**导致无输出。
+
+### 13.3 Windows 网络栈的干扰（顺带记录）
+
+排查同期发现本机 `ping 192.168.1.30` 报
+`PING: transmit failed. General failure.`，连 ping 自己 `192.168.1.100` 也一样，
+`arp -a` 里对应网卡没有动态邻居条目 —— **这是 PC 侧网络栈坏了，不是板子**。
+遇到这种"连自己都 ping 不通"，先 `netsh winsock reset` 再重启，不要动固件。
+
+> ⚠ 沙箱/受限权限下 `Get-PnpDevice` / `Get-NetIPAddress` / `Get-NetAdapter` /
+> `Get-NetRoute` / `Get-CimInstance` 会**静默返回空**。此时改用原生命令：
+> `reg query`、`netstat -ano`、`ipconfig`、`route print`、`arp -a`、`tasklist`。

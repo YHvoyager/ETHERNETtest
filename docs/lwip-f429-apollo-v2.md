@@ -595,3 +595,43 @@ PCF8574 没有方向寄存器，写一个字节就是驱动全部 8 个脚。第
 | UDP 回环 | `Core/Src/udp_echo.c` |
 | 初始化顺序 | `Core/Src/main.c` → `main()` |
 | IP 配置 | `LWIP/App/lwip.c:63-74` |
+
+---
+
+## 附二：串口看不到打印时的现场诊断（2026-10-18）
+
+**症状**：串口助手完全没有输出，而波特率/校验/流控设置都是对的；且"以前能打"。
+
+**先把代码排除掉**（这一步很重要，否则会在正确的代码里瞎改）：
+
+| 检查 | 结论 |
+|---|---|
+| `Core/Src/debug_uart.c:29` 的 `_write` | 强符号，**链接器选中了它**（`build/Debug/ETHERNETtest.map:24021` 指向 `debug_uart.c`，`syscalls.c` 的弱版本被丢弃） |
+| `printf` 调用链 | `printf → iprintf → _vfiprintf_r → __sfvwrite_r → _write`，反汇编确认 `_write` 里是 `HAL_UART_Transmit(&huart1, …, 1000)` |
+| 时序 | `MX_USART1_UART_Init()`（`main.c:102`）→ `Debug_UART_Banner()`（`main.c:122`），无栅栏 |
+| USART1 引脚 | 反汇编 `HAL_UART_MspInit`：AF7、`GPIO_SPEED_FREQ_VERY_HIGH`、PA9/PA10、USART1 时钟使能，**全部正确** |
+| 唯一风险 | `debug_uart.h` 里声明了 `__io_putchar` 但 `debug_uart.c` 没包含它 → `-Wmissing-prototypes` 隐患；且 `__io_putchar` 在 nano printf 路径上根本不参与（`_write` 已被覆盖）。**可删** |
+
+**结论：本工程源码路径无缺陷，问题在 PC 侧或"烧进去的不是这份固件"。**
+
+**现场实测（同一时刻，同一台 PC）**：
+
+| 探测 | 结果 | 解读 |
+|---|---|---|
+| `ping 192.168.1.30` | `PING: transmit failed. General failure.` | **IP 层就没出去** |
+| `ping 192.168.1.100`（Windows 自己的地址） | 同样 `General failure` | **三层协议栈在拒绝本机 IPv4** |
+| `arp -a`（192.168.1.100 网卡） | 只有广播/组播条目，**无动态邻居** | ARP 请求根本没发出去 |
+| `route print -4` | 192.168.1.0/24 `On-link` 路由存在 | 路由没问题，是发包层的策略拦截 |
+| `netstat -an` | `UDP 192.168.1.100:8080 192.168.1.30:8080` | **`0.0.0.0:8080` 已被某进程占用** |
+| `Get-Process` 中出现 `UE4`（≈14 GB） | 加载 UE4/UE5 大工程时磁盘和串口同样抢不到 | 疑似串口被它占着 |
+| 打开 `COM22` | `Access to the path 'COM22' is denied` | **串口正被别的进程独占**（同时 COM3 能开、COM4 超时，证明不是"打开方式"的问题） |
+| `ETHERNETtest.elf` 时间戳 | 2026-10-16 23:13 | `main.c` 在 **23:20:42 和 10-17 00:05:14** 又改过 → **hex 是旧的，板子里跑的不是现在的代码** |
+
+**结论**：串口"没打印"不是板子不发，而是①端口被别的进程独占，②烧的是旧 hex，③本机发包路径被拦截（网络侧的主因）。
+
+**下次排查顺序（照做即可）**：
+
+1. `Get-Process | ? { $_.ProcessName -match 'UE4|Unreal|XCOM|sscom|Serial' }` —— 有就关掉；拔插 USB 让 CH340 重新枚举，换到 COM11（注册表 `PortName` 仍是 COM11，`SERIALCOMM` 里的 COM22 是残留）。
+2. 重新 `cmake --build build/Debug` + `objcopy → .hex`，确认 `.hex` 时间戳比 `main.c` 新，再烧。
+3. 串口助手只开**一个**实例，校验 115200-8-N-1、无流控；不行就先关掉程序、用 `[System.IO.Ports.SerialPort]::Open()` 在 PowerShell 里裸开一次，能开说明是软件抢口。
+4. 网络侧：跑一次 `Restart-Service Dnscache` 或 `netsh winsock reset`（需管理员，重启后生效）；若 `ping 本机` 仍是 `General failure`，是 Windows 网络栈/安全软件状态，与本工程无关。

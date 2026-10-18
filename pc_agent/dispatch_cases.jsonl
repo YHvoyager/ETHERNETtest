@@ -1,0 +1,83 @@
+# dispatcher 的离线自测集。
+#
+# 一行一条：{"raw": 你平时会怎么说, "action": 期望的 action, "arg": 期望的参数}
+#
+# 规则：
+#   * 这个文件是**验收标准** —— `python dispatcher.py --test` 跑它，
+#     规则层必须 100% 通过（规则层是确定性的，过不了就是规则写错了）。
+#   * 只写 `action` 不写 `arg` 表示 "只要 action 对，参数不管"。
+#   * `action: null` 表示期望被**拒绝**（说法太模糊，不该瞎猜）。
+#   * 以 # 开头的是注释，空行忽略。
+#
+# 想加新的说法：直接加一行，然后 --test。规则接不住再交给 LLM 那层。
+
+# ---- 开关屏 ----
+{"raw": "清屏", "action": "cmd", "arg": "OLED CLR"}
+{"raw": "把屏幕清干净", "action": "cmd", "arg": "OLED CLR"}
+{"raw": "黑屏", "action": "cmd", "arg": "OLED CLR"}
+{"raw": "关屏", "action": "cmd", "arg": "OLED OFF"}
+{"raw": "把屏幕关了", "action": "cmd", "arg": "OLED OFF"}
+{"raw": "开屏", "action": "cmd", "arg": "OLED ON"}
+{"raw": "把屏幕打开", "action": "cmd", "arg": "OLED ON"}
+{"raw": "屏幕全亮", "action": "cmd", "arg": "OLED FILL"}
+{"raw": "唤醒屏幕", "action": "cmd", "arg": "OLED ON"}
+{"raw": "亮一下屏幕", "action": "cmd", "arg": "OLED ON"}
+{"raw": "让屏幕熄灭", "action": "cmd", "arg": "OLED OFF"}
+{"raw": "重新初始化屏幕", "action": "cmd", "arg": "OLED INIT"}
+
+# ---- 带参数的说法：参数不能被规则层丢掉 ----
+{"raw": "播眼睛 5 秒", "action": "anim", "arg": "eyes"}
+{"raw": "播汽车 2 倍速", "action": "anim", "arg": "car"}
+
+# ---- LED ----
+{"raw": "把灯打开", "action": "cmd", "arg": "LED 0 1"}
+{"raw": "开灯", "action": "cmd", "arg": "LED 0 1"}
+{"raw": "亮灯", "action": "cmd", "arg": "LED 0 1"}
+{"raw": "把灯关了", "action": "cmd", "arg": "LED 0 0"}
+{"raw": "关灯", "action": "cmd", "arg": "LED 0 0"}
+{"raw": "灭灯", "action": "cmd", "arg": "LED 0 0"}
+{"raw": "灯的状态", "action": "cmd", "arg": "LED"}
+{"raw": "把灯1打开", "action": "cmd", "arg": "LED 1 1"}
+{"raw": "板子上的灯亮一下", "action": "cmd", "arg": "LED 0 1"}
+
+# ---- 探活 / 状态 ----
+{"raw": "ping", "action": "query", "arg": "PING"}
+{"raw": "在吗", "action": "query", "arg": "PING"}
+{"raw": "活着吗", "action": "query", "arg": "PING"}
+{"raw": "板子还在吗", "action": "query", "arg": "PING"}
+{"raw": "板子信息", "action": "query", "arg": "INFO"}
+{"raw": "状态", "action": "query", "arg": "INFO"}
+{"raw": "板子现在什么状态", "action": "query", "arg": "INFO"}
+{"raw": "帧统计", "action": "query", "arg": "FB?"}
+{"raw": "丢包了吗", "action": "query", "arg": "FB?"}
+{"raw": "刷屏卡不卡", "action": "query", "arg": "OLED STAT"}
+{"raw": "帮助", "action": "query", "arg": "HELP"}
+{"raw": "有哪些命令", "action": "query", "arg": "HELP"}
+
+# ---- 内置动画 ----
+{"raw": "播汽车", "action": "anim", "arg": "car"}
+{"raw": "放个烟花", "action": "anim", "arg": "fireworks"}
+{"raw": "来点雨", "action": "anim", "arg": "rain"}
+{"raw": "下雨", "action": null}
+{"raw": "播下雨", "action": "anim", "arg": "rain"}
+{"raw": "眼睛", "action": null}
+{"raw": "播一个眨眼的眼睛", "action": "anim", "arg": "eyes"}
+{"raw": "来匹马", "action": "anim", "arg": "horse"}
+{"raw": "弹跳的球", "action": null}
+{"raw": "来个弹跳的球", "action": "anim", "arg": "boing"}
+{"raw": "显示滚动文字", "action": "anim", "arg": "text"}
+
+# ---- 只渲染不发板子 ----
+{"raw": "渲染一帧看看", "action": "render"}
+{"raw": "先别发板子，只看看效果", "action": "render"}
+
+# ---- 应该被拒绝：太模糊，不该瞎猜 ----
+{"raw": "给我讲个笑话", "action": null}
+{"raw": "今天天气怎么样", "action": null}
+
+# ---- 排障类说法：要给出提示，而不是乱猜一个动画 ----
+{"raw": "屏幕上一个字都没了", "action": null}
+
+# ---- 中文名词陷阱：别把"马上""汽车站"当成动画 ----
+{"raw": "我马上回来", "action": null}
+{"raw": "我在汽车站", "action": null}

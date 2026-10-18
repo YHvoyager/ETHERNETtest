@@ -786,7 +786,7 @@ token   = base64url(JSON(payload)) + "." + base64url(HMAC-SHA256(KEY, body))
 > ⚠ **这两个都是"够用"级别的防护，不是认证**。真要暴露公网，前面必须加
 > 反向代理 + 密码。见 §11 待办。
 
-**自测**（`python pc_agent/api.py --selftest`，24 项，不需要浏览器）：
+**自测**（`python pc_agent/api.py --selftest`，33 项，不需要浏览器）：
 
 覆盖 token 验签/改签/过期/复用、Host 头拒绝、只读直执行、写操作只发票、
 RCC 写被拒、闲聊被拒、长任务进度与 `sent` 序列、多路并发、坏输入。
@@ -852,9 +852,14 @@ RCC 写被拒、闲聊被拒、长任务进度与 `sent` 序列、多路并发�
 | `status` | 前端行为 |
 |---|---|
 | `done` | 直接显示回包正文。只读查询服务端已经执行过了 |
+| `done` + `play:true` | **画面请求**：服务端只翻译、没发帧，前端接着调 `/play` 真播。判据是 `d.play`，不是"是不是 anim" |
 | `needs_confirm` | 显示"将会发什么" + `[确认执行]`，**倒计时到 0 自动禁用** |
 | `refused` | 显示 `why`，提示换个说法。**不提供"硬执行"按钮** |
 | `error` | 显示原始 JSON，方便排查 |
+
+> ⚠ **`done` 不等于"动画已经播了"。** 翻译和执行是两段：`/dispatch` 只回
+> `{action:"anim", play:true, seconds:3}`，帧要前端再发一次 `/play` 才出去。
+> 这条分叉漏过两次（前端没接上、后端顺手也播一遍），详见 §3.12.4。
 
 > ⚠ **前端不拼固件命令、不判断哪些是写操作。** 所有安全判据都在服务端
 > （`dispatcher.needs_confirm()` + `api.py` 的 token 验签）。改这个页面的 JS
@@ -892,7 +897,7 @@ HTTP 里要的是"渲染 N 帧 + 进度回调"，所以只借用渲染这一半�
 **自测**（离线，不需要浏览器）：
 
 ```bash
-python pc_agent/api.py --selftest      # 24 项，含 /play 与 /render 的拒绝路径
+python pc_agent/api.py --selftest      # 33 项，含动画"只翻译不播"与 /play /render 的拒绝路径
 ```
 
 **手工验收清单**（真机，`python pc_agent/api.py --open`）：
@@ -908,6 +913,60 @@ python pc_agent/api.py --selftest      # 24 项，含 /play 与 /render 的拒�
 | 右侧「预览」 | 出现 128×64 的像素图 |
 | `今天天气怎么样` | 灰色「没听懂」+ 建议 |
 
+
+### 3.12.4 ⚠ 画面请求是"翻译"和"执行"两段（踩过两次）
+
+**问题**：用户说"播放个烟花"，结果返回 `出错 … "error":"anim 的执行器还没接"`。
+
+**根因**：`/dispatch` 只负责**翻译**。`dispatcher` 判 `anim` 是只读动作 →
+`needs_confirm=false` → `_post_dispatch` 直接落进 `run_plan()`，而 `run_plan()`
+只会处理 `cmd/query/led_blink`，画面动作落到兜底的
+`"%s 的执行器还没接"`。真正能发帧的 `POST /play` **只有确认按钮那一支会调**，
+而画面动作永远不弹确认 —— 于是这条路是死的。
+
+**现在的分工**（两边都不能碰对方的活）：
+
+```
+POST /dispatch  {"text":"播放个烟花"}
+     ↓  只翻译，绝不发帧
+{"action":"anim","arg":"fireworks","status":"done","play":true,"seconds":3.0,
+ "result":{"frames":0,"sent":[],"reply":""}}
+     ↓  前端看到 play:true
+POST /play      {"text":"播放个烟花","seconds":3.0}
+     ↓  才真的把 60 帧发出去
+{"ok":true,"frames":60,"fps_real":20.0,
+ "reply":"FB: good=152 bad=0 ooo=168 resync=5"}
+```
+
+| 约束 | 理由 |
+|---|---|
+| `run_plan()` 遇到 `anim`/`draw` **只报错不执行**（`"%s 是画面动作，不在这里执行：请发 POST /play"`） | 曾一度改成转发 `_play_plan()`，结果 `/dispatch` 自己播了 3 秒、前端再播一遍 —— **播两遍**。同一个动作只有一条执行路径 |
+| `_post_dispatch` 的判据是 `plan["action"] in ("anim","draw")`，返回值带 `play:true` + `seconds` | 前端靠 `d.play` 分派，不靠"是不是 anim"猜 |
+| 前端 `say()` 里写 `if (d.play)`，**不写 `if (isAnim)`** | `isAnim` 这个词曾经用来判"要不要弹确认"，含义已经变过两次，是过期判据 |
+| 时长优先级：话里说的（`plan["seconds"]`）> 请求体 `seconds` > 默认 3 秒 | "播 5 秒烟花"必须尊重用户；没说的用默认 |
+| 倍速走 `speed`，`t = (n/fps) * speed` | **不能靠提 fps 加速**：I2C 100kHz 下整屏约 92ms ≈ 11fps 硬上限，fps 提到 20 只是丢帧 |
+
+> ⚠ **`status:"done"` 不等于"动画已经播了"。** 对画面请求，它只表示
+> "翻译成功，请接着去 `/play`"。`result.frames == 0` 是这个阶段的正常值，
+> 别拿它当失败判据。
+
+**连带修掉的两个前端 bug**：
+
+| 现象 | 根因 | 修法 |
+|---|---|---|
+| `led_blink` 确认后显示"失败"，其实灯在闪 | `/confirm` 对长任务返回 **202 + `status:"running"`**，前端把非 200 或非 `done` 当失败 | 判 `r.job` 走 `await pollJob(r.job, ...)` 轮询到底 |
+| 确认按钮文案两张卡不一致 | 一支写"确认发送"、一支写"确认执行" | 统一 `确认执行` |
+
+**自测**（`python pc_agent/api.py --selftest`，33 项）新增 9 项专盯这条分叉：
+
+```
+分派成 anim / 不要确认 / status=="done" / play is True / frames==0 /
+plan["seconds"]==5.0 / 默认 3 秒 / speed==2.0 / _num_or("abc",3.0)==3.0
+```
+
+> **为什么会漏**：我一开始只验证了「`/play` 单独发能不能播」，
+> 没走页面真正的路径 `/dispatch → /play`。**接口逐个都对，串起来是断的。**
+> 验收必须走用户实际会走的整条链路，而不是逐段测完就宣布成功。
 
 ### 3.13 ⚠ float 坐标会让 Bresenham 死循环（PC 端，踩过一次）
 
@@ -1234,6 +1293,91 @@ clangd `.cache/`、`__pycache__/`、OS 垃圾文件，以及 **`pc_agent/dispatc
 ## 10. 变更日志
 
 > **每次改动代码后在此追加一条，最新的在最上面。**
+
+### 2026-02-13 — 修「播放个烟花」报 `anim 的执行器还没接` + proto 心跳错位
+
+**现象**（用户实点页面）：说 `播放个烟花`，卡片上显示 `出错`，原始 JSON 里
+`"status":"error"` 且 `"error":"anim 的执行器还没接"`。
+
+**根因**：`/dispatch` 只翻译。`anim` 被判只读 → `needs_confirm=false` →
+`_post_dispatch` 直接落进 `run_plan()`，而它只处理 `cmd/query/led_blink`，
+画面动作撞上兜底报错。真正能发帧的 `POST /play` 只有"点确认"那一条分支会调，
+画面动作永远不弹确认 —— **这条路是死的**。详见 §3.12.4。
+
+> **我的责任**：上一轮只验证了 `POST /play` 单独发能不能播、`/dispatch` 单独发
+> 返回什么，**没在页面里点过**。接口逐个都对，串起来是断的。
+
+#### 画面请求改成"两段"（`pc_agent/api.py` + `pc_agent/index.html`）
+
+1. **`/dispatch` 对 `anim`/`draw` 返回 `status:"done"` + `play:true` + `seconds`**，
+   `result.frames` 为 0（翻译阶段本来就没发帧）。**绝不在这里发帧。**
+2. **`run_plan()` 遇到 `anim`/`draw` 只报错**：`"%s 是画面动作，不在这里执行：请发 POST /play"`。
+   曾一度改成直接转发 `_play_plan()`，结果 `/dispatch` 自己播了 3 秒、前端再播一遍
+   —— **播两遍**。同一个动作只能有一条执行路径。
+3. **前端 `say()` 用 `if (d.play)` 分派**去调 `playAnim()`，不再用 `isAnim`
+   那种"猜是不是动画"的过期判据。
+4. **动画默认播 3 秒**（`ANIM_DEFAULT_SECONDS`），播完给「再播一次」按钮。
+   时长优先级：话里说的（`plan["seconds"]`）> 请求体 `seconds` > 默认 3 秒；
+   上限 `ANIM_MAX_SECONDS = 30`。
+5. **倍速走 `plan["speed"]`，`t = (n/fps) * speed`**。**不能靠提 fps 加速** ——
+   I2C 100kHz 下整屏约 92ms ≈ 11fps 硬上限，fps 提到 20 只是丢帧。
+6. 连带修掉两个前端 bug：`led_blink` 收到 `202 + status:"running"` 被当成失败
+   （改判 `r.job` 走 `await pollJob(...)`）；确认按钮文案两支不一致（统一「确认执行」）。
+7. `api.py` 的 `selftest()` **24 项 → 33 项**，新增 9 项专盯这条分叉：
+   分派成 anim / 不要确认 / `status=="done"` / `play is True` / `frames==0` /
+   `plan["seconds"]==5.0` / 默认 3 秒 / `speed==2.0` / `_num_or("abc",3.0)==3.0`。
+
+#### `pc_agent/proto.py` 心跳错位（同一批里查出来的）
+
+**现象**：经 `api.py` 跑端到端时，`FB?` 收到了 `STM32F429 在线，已收 115 条，命令 48 条`。
+
+**根因两件事叠在一起**：
+
+| # | 问题 | 真相 |
+|---|---|---|
+| 1 | 我把每秒心跳当成了 `INFO` 的回应 | 固件里 `INFO` 回的是 `board 192.168.1.30  tick=... ms  io_count=2`（`Core/Src/reg_shell.c:392` 的 `cmd_info()`）；`STM32F429 在线...` 是 `Echo_Service_Poll()` 每秒主动推的**心跳**（`Core/Src/echo_service.c:638`） |
+| 2 | `send_text()` 只 `recvfrom` 一次 | 收到任何"在途旧包/心跳"就当成本条回应 —— **一次错位之后每条命令都拿到上一条的回应**，看起来像协议错位 |
+
+**修法**：
+
+```python
+_HEARTBEAT_PREFIXES = ("STM32F429", "心跳")
+
+def _is_heartbeat(text: str) -> bool:
+    t = text.lstrip()
+    for p in _HEARTBEAT_PREFIXES:
+        if t.startswith(p):
+            return True
+    return False
+```
+
+`send_text()` 改为：① 发之前先用 `settimeout(0.02)` **排空积压**；② 发之后循环收，
+`_is_heartbeat()` 为真的包**丢弃继续等**；③ 到 deadline 才抛
+`BoardError("板子没有回包（超时）。检查：网线、板子是否在 %s、Windows 防火墙、以及是否用了正确的端口。")`。
+判不准是不是心跳时**当成回应**（宁可错收一条，也不要空等超时）。
+
+> ⚠ **诊断教训**：我一度给 `_is_heartbeat()` 写了反向特例
+> （`if t.startswith("STM32F429") and "已收" in t: return False`）来"修正"一个
+> 并不存在的错位，白折腾一轮。**"回包错位"和"我把协议记错了"看起来一模一样。
+> 下结论前先去固件读回应格式**（`reg_shell.c` 的 `cmd_info()` / `echo_service.c` 的心跳），
+> 别凭记忆写断言。
+
+#### 验证
+
+| 项 | 结果 |
+|---|---|
+| `_probe_fb2.tmp.py`（5 条 `_is_heartbeat` + Board 直连 2 轮 × 5 条命令） | 全 PASS，`FB?`→`FB:`、`INFO`→`board `、`PING`→`PONG` 各归各位 |
+| `_e2e_anim.tmp.py`（按页面真实路径 `/dispatch → /play`） | 全过。`播放个烟花`→`play=true seconds=3.0`；`/play`→`frames=60 fps_real=20.0 reply='FB: good=152 bad=0 ooo=168 resync=5'`；`播 2 秒 烟花`→`seconds=2.0`；`在吗`→done 无 play；`把灯打开`→needs_confirm 无 play |
+| `dispatcher.py --test` | 58 条，规则层 **84/84**，未命中 7 条 |
+| `api.py --selftest` | **33/33，0 失败** |
+| `agent.py --test` | **10/10**（stderr 的 faulthandler 栈是"故意死循环"用例打的，exit 0） |
+| `_check_js.tmp.py` | 括号配平 + 12 项前端契约全 PASS，3 项死代码已清除 |
+
+> ⚠ **改 `.py` 模块后必须重启常驻服务再验证**。这一轮第一次经 `api.py` 复验仍然失败，
+> 原因是服务进程是在 `proto.py` 修复**之前**启动的 —— 测的是旧模块。`job_kill` 重启后全过。
+
+同步更新 AGENTS.md §3.12.3（「四种结局」表加 `done + play:true` 行）、
+新增 §3.12.4（画面请求两段式）、§3.12.2/§3.12.3 自测行数 24 → 33、§10 本条目。
 
 ### 2026-02-13 — 阶段三：`index.html` 浏览器前端 + `/play` `/render`
 

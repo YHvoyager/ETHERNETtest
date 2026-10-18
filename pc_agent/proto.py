@@ -34,6 +34,28 @@ class BoardError(RuntimeError):
     """板子回了 ERR，或者干脆没回。"""
 
 
+# 心跳长什么样：`Echo_Service_Poll()` 每秒推一次，文案在 echo_service.c:638 ——
+#   `STM32F429 在线，已收 N 条，命令 M 条`
+# ⚠ 别把它和 `INFO` 搞混：`INFO` 的回应是 `board 192.168.1.30 tick=... io_count=2`
+#   （reg_shell.c:392）。两者完全不同，早先我把心跳当成了 INFO 的回应，
+#   白白怀疑了一轮"回包错位"。
+_HEARTBEAT_PREFIXES = ("STM32F429", "心跳")
+
+
+def _is_heartbeat(text: str) -> bool:
+    """
+    这条回包是不是"不请自来"的每秒心跳？
+
+    判据用文案前缀白名单，但**判不准就当成回应**（宁可错收一条，也不要空等超时）。
+    命令回包都是 `[OK]/[ERR]/FB:/PONG/board/0x...` 这类开头，与心跳不重叠。
+    """
+    t = text.lstrip()
+    for p in _HEARTBEAT_PREFIXES:
+        if t.startswith(p):
+            return True
+    return False
+
+
 class Board:
     """一块跑着 ETHERNETtest 固件的板子。"""
 
@@ -72,26 +94,52 @@ class Board:
 
         回包是板子回给"最后来包的那台 PC"的，所以这里必须先把命令发出去，
         板子才知道该回给谁。
+
+        ⚠ 必须**先排空积压**再发命令。板子有两种"不请自来"的包：
+            1. 每秒一次的 UDP 心跳（echo_service 的 Echo_Service_Poll）
+            2. 上一条命令还没被读走的回包（板子有时一条命令回两行）
+          原来这里只 recvfrom 一次，收到哪个算哪个 —— 结果一次错位之后
+          后面**每条命令都拿到上一条的回应**，表现为"FB? 回了 INFO"。
+          这种错位不会报错，只会让数据静默错位，是最难发现的一类。
         """
         if isinstance(line, str):
             payload = line.encode("ascii", "replace")
         else:
             payload = line
 
-        self.sock.sendto(payload, self.addr)
-
         if not expect_reply:
+            self.sock.sendto(payload, self.addr)
             return ""
 
+        # 1) 排空积压：用极短超时连续读到"读不到为止"
+        old_timeout = self.sock.gettimeout()
+        self.sock.settimeout(0.02)
         try:
-            data, _ = self.sock.recvfrom(2048)
-        except socket.timeout:
-            raise BoardError(
-                "板子没有回包（超时）。检查：网线、板子是否在 %s、"
-                "Windows 防火墙、以及是否用了正确的端口。" % (self.host,)
-            ) from None
+            while True:
+                try:
+                    self.sock.recvfrom(2048)
+                except socket.timeout:
+                    break
+        finally:
+            self.sock.settimeout(old_timeout)
 
-        return data.decode("utf-8", "replace")
+        # 2) 发出去，等回应；等到的心跳不算回应
+        self.sock.sendto(payload, self.addr)
+        deadline = time.time() + (old_timeout or 1.0)
+        while time.time() < deadline:
+            try:
+                data, _ = self.sock.recvfrom(2048)
+            except socket.timeout:
+                break
+            text = data.decode("utf-8", "replace")
+            if _is_heartbeat(text):
+                continue          # 心跳不是对这条命令的回应，丢掉继续等
+            return text
+
+        raise BoardError(
+            "板子没有回包（超时）。检查：网线、板子是否在 %s、"
+            "Windows 防火墙、以及是否用了正确的端口。" % (self.host,)
+        )
 
     def ping(self) -> str:
         """最便宜的一次往返，用来确认板子在线。"""

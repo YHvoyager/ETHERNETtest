@@ -347,7 +347,7 @@ async function say(text) {
       // 倒计时：token 过期后按钮自己失效，不必假装还能点
       const row = el("div", "row");
       const okBtn = el("button", d.risk === "reg_write" ? "danger" : "primary",
-                       isAnim ? "确认播放" : "确认执行");
+                       "确认执行");
       const noBtn = el("button", "", "取消");
       const hint = el("span", "hint", `有效期 ${d.expires_in} 秒`);
       let left = d.expires_in;
@@ -373,12 +373,28 @@ async function say(text) {
       return;
     }
 
+    // ---- 画面请求：服务端只翻译，真正的发送在 /play ----    // ⚠ 判据是 d.play 而不是 isAnim：服务端明确说"这条要我播"才播。
+    //   曾经这里缺了整支，导致"播放个烟花"落进下面的 error 分支；
+    //   也曾经在服务端顺手播一次、前端又播一次，同一句话播了两遍。
+    if (d.play) {
+      act.append(tag("t-needs", "准备播放"));
+      act.append(kvBlock([
+        ["动作", d.action],
+        ["参数", d.arg],
+        ["来源", d.by],
+        ["为什么", d.why],
+      ]));
+      const row = el("div", "row");
+      act.append(row);
+      await playAnim(text, row, act, d.seconds || 0);
+      return;
+    }
+
     // ---- 只读：服务端已经执行了，直接显示 ----
     if (d.status === "done") {
       act.append(tag("t-done", "已执行"));
       act.append(kvBlock([["命令", d.result?.sent?.join(" ") || d.arg]]));
       if (d.result?.reply) act.append(el("pre", "reply", d.result.reply));
-      $("info").replaceChildren(...$("info").children); // no-op，保持结构
       return;
     }
 
@@ -393,26 +409,64 @@ async function say(text) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 播动画：POST /play（一次请求播固定时长，播完可以再点一次）
+//
+// ⚠ 不做"一直播到点停"：HTTP 请求必须有尽头。否则页面上看着停了、
+//   后台线程还在发 UDP 占着板子，是最难排查的一类状态。
+// ---------------------------------------------------------------------------
+async function playAnim(text, row, act, seconds = 0) {
+  row.replaceChildren(el("span", "hint", "播放中…"));
+  const bar = el("div", "bar");
+  bar.append(el("i"));
+  act.append(bar);
+
+  const body = { text, fps: 20 };
+  if (seconds > 0) body.seconds = seconds;   // 0 = 让服务端按话里说的/默认值决定
+
+  try {
+    const d = await post("/play", body);
+    bar.firstChild.style.width = "100%";
+
+    if (d.status === "done") {
+      row.replaceChildren(tag("t-done", "播放完成"));
+      const r = d.result || {};
+      const hint = el("span", "hint",
+        `${r.frames ?? "?"} 帧 · 实际 ${r.fps_real ?? "?"} fps` +
+        (d.seconds ? ` · 时长 ${d.seconds}s` : ""));
+      row.append(hint);
+      if (r.reply) row.append(el("span", "hint", r.reply));
+
+      // 播完给一个"再播一次"的按钮，而不是让用户重打一遍
+      const again = el("button", "", "再播一次");
+      again.onclick = () => playAnim(text, row, act, d.seconds || seconds);
+      row.append(again);
+    } else {
+      row.replaceChildren(tag("t-error", "播放失败"));
+      row.append(el("span", "hint", d.error || d.result?.error || "未知错误"));
+    }
+  } catch (e) {
+    row.replaceChildren(tag("t-error", "播放失败"), el("span", "hint", String(e)));
+  }
+}
+
 async function confirmAndRun(d, act, row) {
-  const isAnim = d.action === "anim" || d.action === "draw";
   row.replaceChildren(el("span", "hint", "执行中…"));
   const bar = el("div", "bar"); bar.append(el("i"));
   act.append(bar);
 
+  // ⚠ LED 闪灯是长任务（闪 50 次要 20 秒），服务端会回 202 + job，
+  //   这条请求必须转成轮询，否则要干等 20 秒、还没进度。
+  //   （动画不走这里 —— 它们在 done 分支就直接 /play 了，见 say()）
+  const long = d.action === "led_blink";
+
   try {
-    if (isAnim) {
-      // 动画：一次播 3 秒，想继续再点一次。不做"一直播到点停"——
-      // 那样页面上看着停了，后台线程还在发 UDP，最难排查。
-      const SECONDS = 3, FPS = 20;
-      const d2 = await post("/confirm", { token: d.token });
-      if (d2.status === "running" && d2.job) {
-        await pollJob(d2.job, bar.firstChild, row);
-      } else {
-        row.replaceChildren(el("span", "hint", d2.error || "没启动起来"));
-      }
+    const r = await post("/confirm", long ? { token: d.token, async: true }
+                                          : { token: d.token });
+    if (r.status === "running" && r.job) {
+      await pollJob(r.job, bar.firstChild, row);
       return;
     }
-    const r = await post("/confirm", { token: d.token });
     bar.firstChild.style.width = "100%";
     if (r.status === "done") {
       row.replaceChildren(tag("t-done", "已执行"));

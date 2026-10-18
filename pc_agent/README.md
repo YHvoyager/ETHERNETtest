@@ -184,9 +184,9 @@ python pc_agent/agent.py --code ... # 或直接用内置的 text 动画
 
 | 文件 | 干什么 |
 |---|---|
-| `proto.py` | UDP 通道：文本命令 + 二进制帧 |
+| `proto.py` | UDP 通道：文本命令 + 二进制帧（**会过滤板子每秒的心跳**） |
 | `canvas.py` | 128x64 画布 + 全套画图原语 + 内置 ASCII 字体 |
-| `anim.py` | 内置示例动画（eyes / horse / rain / boing / text） |
+| `anim.py` | 内置示例动画（eyes / eyes_fast / horse / car / rain / boing / text / fireworks） |
 | `bitmap.py` | 中文点阵渲染（Windows GDI） |
 | `sandbox.py` | 沙箱：import 白名单、名字白名单、超时 |
 | `agent.py` | 主程序：CLI、LLM 调用、播放循环、代码缓存 |
@@ -242,7 +242,7 @@ python pc_agent/dispatcher.py --test              # 跑自测集
 
 ```bash
 python pc_agent/api.py              # http://127.0.0.1:8765
-python pc_agent/api.py --selftest   # 24 项自测（会真的点灯，需要板子在线）
+python pc_agent/api.py --selftest   # 33 项自测（会真的点灯，需要板子在线）
 ```
 
 | 方法 | 路径 | 作用 |
@@ -278,9 +278,18 @@ python pc_agent/api.py --open      # 起服务并自动打开浏览器
 `api.py` 直接从磁盘读它。左边说一句话，右边看画面预览和板子状态。
 
 每轮对话是一张卡片：**说的话 → 状态 → 动作/参数/来源/为什么 → 将要发什么 → [确认执行]**。
-四种结局：`done` 直接显示回包；`needs_confirm` 才给确认按钮（带倒计时，
+五种结局：`done` 直接显示回包；`done` + `play:true` 是画面请求，前端接着调
+`/play` 真播（**服务端只翻译，不发帧**）；`needs_confirm` 才给确认按钮（带倒计时，
 到点自动失效）；`refused` 只解释为什么没懂，**不给"硬执行"的按钮**；
 `error` 打印原始 JSON。
+
+> ⚠ **`done` 不等于"动画已经播了"。** 画面请求走两段：`/dispatch` 回
+> `{action:"anim", play:true, seconds:3}`，前端看到 `play` 再发 `/play`。
+> `result.frames == 0` 是翻译阶段的正常值。**一条执行路径只能有一个出口** ——
+> 曾经让 `/dispatch` 顺手也播一遍，结果播了两遍。
+
+**动画默认播 3 秒**，播完给「再播一次」按钮。想播更长就说"播 5 秒烟花"，
+想快就加"2 倍速"（倍速是压缩动画时间轴，不是提 fps —— I2C 卡的 11fps 是硬上限）。
 
 新增两个路由（只有前端用）：
 
@@ -288,6 +297,11 @@ python pc_agent/api.py --open      # 起服务并自动打开浏览器
 |---|---|---|
 | POST | `/play` | `{text, seconds, fps}` → 真的逐帧发到板子，返回 `frames` / `fps_real` |
 | POST | `/render` | `{text, t}` → 回 `image/png`，**不发板子** |
+
+**板子每秒会主动推一条心跳** `STM32F429 在线，已收 N 条…`，它**不是**任何命令的
+回应（固件 `Core/Src/echo_service.c` 的 `Echo_Service_Poll()`）。`proto.py` 的
+`send_text()` 会把它丢掉继续等真正的回应，否则一次错位之后**每条命令都拿到上一条的回包**。
+`INFO` 的回应是 `board 192.168.1.30  tick=… ms  io_count=2`，别和心跳混。
 
 > **为什么 `/play` 是"播 3 秒"而不是"一直播到点停"**：HTTP 请求必须有尽头。
 > 否则会出现"页面上什么都看不见、后台线程还在发 UDP 占着板子"这种最难查的状态。
@@ -347,4 +361,6 @@ python pc_agent/agent.py check      # 里面有 FB? 一行
 | 画面撕裂/倒退 | 正常丢包。默认已经带 `FBSEQ` 序号抗乱序 |
 | 屏全黑 | 发 `OLED INIT` 重试；波特律动驱动会吞掉 I2C 错误，串口不报错 ≠ 写成功 |
 | 终端里 `--ascii` 乱码 | Windows 控制台编码，用 `chcp 65001` |
+| 页面上说"播个烟花"，回包是 `STM32F429 在线…` | 拿到的是**每秒心跳**不是 `FB?` 的回应（`FB: good=…`），说明 `proto.py` 的过滤或服务进程是旧的 —— **改完 `.py` 要重启 `api.py`** |
+| 页面报 `xxx 的执行器还没接` | 画面动作不该走 `/dispatch`：服务端只回 `play:true`，帧由前端再发 `/play` |
 | LLM 报错 | 看提示，通常是没设 `DEEPSEEK_API_KEY` |

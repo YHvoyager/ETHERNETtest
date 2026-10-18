@@ -223,7 +223,7 @@ def run_plan(plan: Dict[str, Any], host: str, port: int, timeout: float,
     out: Dict[str, Any] = {"ok": False, "sent": [], "reply": "", "error": ""}
 
     # 这两类在阶段一就只有占位，阶段二也不假装能执行 —— 明确说"还没接"。
-    if action in ("render", "knowledge", "draw"):
+    if action in ("render", "knowledge"):
         out["error"] = ("action=%s 的执行器还没接（见 AGENTS.md §11 待办）"
                         % action)
         return out
@@ -234,9 +234,23 @@ def run_plan(plan: Dict[str, Any], host: str, port: int, timeout: float,
     if action == "led_blink":
         return _run_led_blink(arg or {}, host, port, timeout, out, report)
 
+    # anim/draw 的执行方式是"渲染一帧发一帧"，只有一个合法入口：/play。
+    # ⚠ 这里**绝不能**自己调 _play_plan 播一遍：前端拿到 done 之后还会再调
+    #   /play（index.html 的 playAnim），两边都播就是同一句话播两遍。
+    #   "动画播两遍"不会报错，只会让用户觉得慢半拍，最难查。
+    # ⚠ 但也**不能**让它们落进下面的兜底分支 —— 原来那里只回一句
+    #   "anim 的执行器还没接"，既没说是哪条路能走，也让人以为功能没做。
+    if action in ("anim", "draw"):
+        out["error"] = ("%s 是画面动作，不在这里执行：请发 POST /play"
+                        % action)
+        return out
+
     cmd = arg if action in ("cmd", "query") else None
     if not cmd:
-        out["error"] = "%s 的执行器还没接" % action
+        # 走到这里说明 action 是 ACTIONS 里有、但本函数没接的（将来新增的动作）。
+        # 错误信息要说明"哪条路能走"，否则用户只知道失败了、不知道下一步。
+        out["error"] = ("action=%s 不能直接执行：写命令走 /confirm，"
+                        "画面走 /play" % action)
         return out
 
     # 板子之前再验一次命令白名单：HTTP 层是外部输入进来的，不信票。
@@ -389,6 +403,27 @@ def _start_job(raw: str, plan: Dict[str, Any], cfg: Dict[str, Any]) -> Job:
 # ---------------------------------------------------------------------------
 
 ANIM_MAX_SECONDS = 30.0        # 单次播放上限：别让一条请求占住板子半小时
+ANIM_DEFAULT_SECONDS = 3.0     # 没说时长时播多久（用户定的默认值）
+ANIM_DEFAULT_FPS = 20.0
+
+
+def _plan_seconds(plan: Dict[str, Any], fallback: float) -> float:
+    """
+    取"这条指令要播多久"。
+
+    规则层已经把"播 5 秒"认成 arg 之外的 seconds 了（dispatcher.py 的
+    `_plan(..., **extra)`），阶段二之前没人读它 —— 等于用户说了白说。
+    这里补上：说了就用他说的，没说才用默认值。
+    """
+    return _num_or(plan.get("seconds"), fallback)
+
+
+def _num_or(v: Any, fallback: float) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return float(fallback)
+    return f if f > 0 else float(fallback)
 
 
 def _make_renderer(plan: Dict[str, Any]) -> Tuple[Any, str]:
@@ -418,7 +453,8 @@ def _make_renderer(plan: Dict[str, Any]) -> Tuple[Any, str]:
 
 
 def _play_plan(plan: Dict[str, Any], cfg: Dict[str, Any],
-               seconds: float, fps: float, report=None) -> Dict[str, Any]:
+               seconds: float = ANIM_DEFAULT_SECONDS,
+               fps: float = ANIM_DEFAULT_FPS, report=None) -> Dict[str, Any]:
     """
     把一帧帧真的发到板子上。返回 {"ok", "sent", "reply", "error", "frames", "fps_real"}。
 
@@ -435,6 +471,11 @@ def _play_plan(plan: Dict[str, Any], cfg: Dict[str, Any],
     seconds = max(0.1, min(ANIM_MAX_SECONDS, float(seconds)))
     fps = max(1.0, min(60.0, float(fps)))
     total = int(seconds * fps)
+
+    # "2 倍速"：动画自身的时间轴走得更快，我们发的帧数不变。
+    # ⚠ 不能靠提高 fps 来实现倍速 —— I2C 100kHz 下整屏约 92ms（硬上限 ≈11fps），
+    #   多发帧只会被板子覆盖，看起来一样快但丢的包更多。
+    speed = max(0.1, min(10.0, _num_or(plan.get("speed"), 1.0)))
 
     try:
         render, what = _make_renderer(plan)
@@ -454,7 +495,7 @@ def _play_plan(plan: Dict[str, Any], cfg: Dict[str, Any],
 
         try:
             while n < total:
-                t = n / fps
+                t = (n / fps) * speed          # 倍速只改动画自己的时间轴
                 frame = render(t, {})
                 b.send_frame(frame, seq=(n & 0xFFFF))
                 n += 1
@@ -678,6 +719,18 @@ class Handler(BaseHTTPRequestHandler):
             out["preview"] = _preview(plan)
             return self._json(200, out)
 
+        # ⚠ 画面请求只翻译、不执行：真正的发送入口是 /play（见下方 _post_play）。
+        #   放进 done 但带上 play=true，前端一眼知道"翻译好了、下一步该播"，
+        #   而不是看到 error 去猜；也保证同一句话只播一遍。
+        if plan.get("action") in ("anim", "draw"):
+            out["status"] = "done"
+            out["play"] = True
+            out["seconds"] = _plan_seconds(plan, ANIM_DEFAULT_SECONDS)
+            out["result"] = {"ok": True, "sent": [], "reply": "",
+                             "error": "", "frames": 0, "fps_real": 0.0}
+            dispatcher.log_plan(plan, executed=False)
+            return self._json(200, out)
+
         # 只读：直接执行，但仍然走 run_plan（它自己再验一次命令白名单）
         res = run_plan(plan, CFG["host"], CFG["port"], CFG["timeout"])
         out["status"] = "done" if res.get("ok") else "error"
@@ -756,8 +809,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "text 不能为空"})
 
         try:
-            seconds = float(data.get("seconds") or 3.0)
-            fps = float(data.get("fps") or 20.0)
+            seconds = _num_or(data.get("seconds"), 0.0)
+            fps = _num_or(data.get("fps"), ANIM_DEFAULT_FPS)
         except (TypeError, ValueError):
             return self._json(400, {"error": "seconds/fps 必须是数字"})
 
@@ -783,6 +836,15 @@ class Handler(BaseHTTPRequestHandler):
                                "写操作请先 /dispatch 再 /confirm"
                                if plan.get("action") else plan.get("why", "")))
             return self._json(200, out)
+
+        # ⚠ 时长的三个来源有优先级：话里说的（"播 5 秒"）> 请求体给的 > 默认 3 秒。
+        #   话里说的排第一，因为规则层已经把它认出来了，丢掉等于让用户白说一遍。
+        said = _num_or(plan.get("seconds"), 0.0)
+        if said > 0:
+            seconds = said
+        elif seconds <= 0:
+            seconds = ANIM_DEFAULT_SECONDS
+        out["seconds"] = round(min(ANIM_MAX_SECONDS, seconds), 1)
 
         res = _play_plan(plan, CFG, seconds, fps)
         dispatcher.log_plan(plan, executed=True)
@@ -993,6 +1055,34 @@ def selftest() -> int:
     [t.join(30) for t in ths]
     check("并发 4 个只读请求都成功",
           results.count("done") == 4, str(results))
+
+    # ---- 动画：/dispatch 只说"要播什么"，真播必须走 /play ----
+    # ⚠ 这条用例是补的回归：阶段三第一次提交后，页面上说"播放个烟花"
+    #   落到 run_plan 的兜底分支，回一句 "anim 的执行器还没接"。
+    #   当时的 24 项自测一条都没覆盖动画 —— 因为全都只走文本命令。
+    #   现在把"翻译"和"执行"两段分开测，谁少接一步都会红。
+    code, r = call("POST", "/dispatch", {"text": "播个烟花"})
+    check("动画：分派成 anim", r.get("action") == "anim",
+          json.dumps(r, ensure_ascii=False))
+    check("动画：只读不要确认", r.get("needs_confirm") is False)
+    check("动画：/dispatch 不报错", r.get("status") == "done",
+          json.dumps(r, ensure_ascii=False))
+    check("动画：/dispatch 标记要播", r.get("play") is True)
+    check("动画：/dispatch 不发动画",
+          (r.get("result") or {}).get("frames", 0) == 0,
+          "翻译不该顺手播一屏，否则前端再发 /play 就播两遍")
+
+    # ---- 时长/倍速参数必须被认出来（规则层认了、执行层不能吞） ----
+    plan = dispatcher.dispatch("播 5 秒 烟花", use_llm=False)
+    check("动画：plan 里有 seconds=5", plan.get("seconds") == 5.0,
+          str(plan.get("seconds")))
+    check("动画：没说时长用默认 3 秒",
+          _plan_seconds(dispatcher.dispatch("播个烟花", use_llm=False),
+                        ANIM_DEFAULT_SECONDS) == ANIM_DEFAULT_SECONDS)
+    check("动画：2 倍速被识别",
+          dispatcher.dispatch("播个烟花的动画 2 倍速",
+                              use_llm=False).get("speed") == 2.0)
+    check("_num_or 兜住脏输入", _num_or("abc", 3.0) == 3.0)
 
     # ---- 坏输入 ----
     code, _ = call("POST", "/dispatch", {"text": ""})

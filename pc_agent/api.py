@@ -447,7 +447,12 @@ def _make_renderer(plan: Dict[str, Any]) -> Tuple[Any, str]:
     if action == "draw":
         code = agent.code_for(str(arg), use_cache=True, verbose=False)
         rend = agent.Renderer(code, timeout=3.0)
-        return (lambda t, p: rend.render(t, p)), "LLM 现写代码"
+        # ⚠ 第一次画某个画面的开销是"调用 LLM 写代码 + 试渲染"，实测 3~10 秒。
+        #   /play 里若把它算进首个帧间隔，绝对时间轴对齐会先把这段时间等掉；
+        #   /render 是同步请求，超时也首先砸在这里。这里先渲染一帧把开销付掉，
+        #   出问题也能在真正发帧之前就报出来。
+        rend.render(0.0, {})
+        return (lambda t, p: rend.render(t, p)), "现画：%s" % arg
 
     raise ValueError("action=%s 造不出渲染器" % action)
 

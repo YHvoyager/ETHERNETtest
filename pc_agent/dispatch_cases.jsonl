@@ -10,7 +10,6 @@
 #   * 以 # 开头的是注释，空行忽略。
 #
 # 想加新的说法：直接加一行，然后 --test。规则接不住再交给 LLM 那层。
-
 # ---- 开关屏 ----
 {"raw": "清屏", "action": "cmd", "arg": "OLED CLR"}
 {"raw": "把屏幕清干净", "action": "cmd", "arg": "OLED CLR"}
@@ -24,11 +23,9 @@
 {"raw": "亮一下屏幕", "action": "cmd", "arg": "OLED ON"}
 {"raw": "让屏幕熄灭", "action": "cmd", "arg": "OLED OFF"}
 {"raw": "重新初始化屏幕", "action": "cmd", "arg": "OLED INIT"}
-
 # ---- 带参数的说法：参数不能被规则层丢掉 ----
 {"raw": "播眼睛 5 秒", "action": "anim", "arg": "eyes"}
 {"raw": "播汽车 2 倍速", "action": "anim", "arg": "car"}
-
 # ---- LED ----
 {"raw": "把灯打开", "action": "cmd", "arg": "LED 0 1"}
 {"raw": "开灯", "action": "cmd", "arg": "LED 0 1"}
@@ -39,7 +36,6 @@
 {"raw": "灯的状态", "action": "cmd", "arg": "LED"}
 {"raw": "把灯1打开", "action": "cmd", "arg": "LED 1 1"}
 {"raw": "板子上的灯亮一下", "action": "cmd", "arg": "LED 0 1"}
-
 # ---- LED 闪烁：灯号和次数都是 0/1 开头的数字，极易串位 ----
 # 这两条都是 HTTP 层实测才暴露的真 bug，见 AGENTS.md §3.12.2。
 {"raw": "闪灯 10 次", "action": "led_blink", "arg": {"index": 0, "times": 10, "period": 0.2}}
@@ -47,7 +43,6 @@
 {"raw": "闪 DS1 3 次", "action": "led_blink", "arg": {"index": 1, "times": 3, "period": 0.2}}
 {"raw": "闪 LED1 4 次", "action": "led_blink", "arg": {"index": 1, "times": 4, "period": 0.2}}
 {"raw": "闪灯2次", "action": "led_blink", "arg": {"index": 0, "times": 2, "period": 0.2}}
-
 # ---- 探活 / 状态 ----
 {"raw": "ping", "action": "query", "arg": "PING"}
 {"raw": "在吗", "action": "query", "arg": "PING"}
@@ -61,7 +56,6 @@
 {"raw": "刷屏卡不卡", "action": "query", "arg": "OLED STAT"}
 {"raw": "帮助", "action": "query", "arg": "HELP"}
 {"raw": "有哪些命令", "action": "query", "arg": "HELP"}
-
 # ---- 内置动画 ----
 {"raw": "播汽车", "action": "anim", "arg": "car"}
 {"raw": "放个烟花", "action": "anim", "arg": "fireworks"}
@@ -74,15 +68,12 @@
 {"raw": "弹跳的球", "action": null}
 {"raw": "来个弹跳的球", "action": "anim", "arg": "boing"}
 {"raw": "显示滚动文字", "action": "anim", "arg": "text"}
-
 # ---- 只渲染不发板子 ----
 {"raw": "渲染一帧看看", "action": "render"}
 {"raw": "先别发板子，只看看效果", "action": "render"}
-
 # ---- 应该被拒绝：太模糊，不该瞎猜 ----
 {"raw": "给我讲个笑话", "action": null}
 {"raw": "今天天气怎么样", "action": null}
-
 # ---- 排障类说法：给出**可执行**的下一步，而不是一句空提示 ----
 # 返回 OLED INIT 而不是 null：建议本身就是一条命令，让用户点确认，
 # 不要让他把我们刚说过的话自己再打一遍。
@@ -90,7 +81,6 @@
 {"raw": "屏幕没亮", "action": "cmd", "arg": "OLED INIT"}
 # 但"问我状态"的说法不能被当成排障转成写操作
 {"raw": "刷屏卡不卡", "action": "query", "arg": "OLED STAT"}
-
 # ---- 寄存器读取：端口名自动算地址，别掉给 LLM 去猜 ----
 {"raw": "GPIOB 的 IDR 是多少", "action": "cmd", "arg": "R 40020410 1"}
 {"raw": "GPIOB 的 PUPDR 是多少", "action": "cmd", "arg": "R 4002040c 1"}
@@ -101,7 +91,14 @@
 {"raw": "读一下寄存器", "action": "cmd", "arg": "HELP"}
 # 纯名词不是读取请求
 {"raw": "GPIOA 是什么", "action": null}
-
 # ---- 中文名词陷阱：别把"马上""汽车站"当成动画 ----
 {"raw": "我马上回来", "action": null}
 {"raw": "我在汽车站", "action": null}
+{"raw": "画一只打哈欠的猫", "action": "draw", "arg": "打哈欠的猫"}
+{"raw": "画一辆汽车", "action": "draw", "arg": "汽车"}
+{"raw": "画个笑脸", "action": "draw", "arg": "笑脸"}
+{"raw": "帮我画一个生气的脸", "action": "draw", "arg": "生气的脸"}
+{"raw": "画一条鲨鱼在游", "action": "draw", "arg": "鲨鱼在游"}
+{"raw": "画一张图", "action": null}
+{"raw": "画个东西", "action": null}
+{"raw": "把眼睛画出来", "action": "anim", "arg": "eyes"}

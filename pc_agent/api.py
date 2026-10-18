@@ -74,6 +74,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import agent            # noqa: E402
+import anim             # noqa: E402
 import dispatcher       # noqa: E402
 from proto import Board, BoardError, DEFAULT_HOST, DEFAULT_PORT  # noqa: E402
 from sandbox import SandboxError  # noqa: E402
@@ -375,6 +376,139 @@ def _start_job(raw: str, plan: Dict[str, Any], cfg: Dict[str, Any]) -> Job:
 
 
 # ---------------------------------------------------------------------------
+# 动画：翻译成"真的画一帧发出去"
+#
+# ⚠ 阶段二 run_plan() 对 anim/draw/render 只说"执行器还没接"。阶段三前端要
+#   真的看到屏幕动，所以在这里补上。但判据仍然全部来自 dispatcher ——
+#   这里只多了"怎么发给板子"这件事。
+#
+# ⚠ 为什么用**短时长**而不是一直播到用户点停：
+#   HTTP 请求必须有尽头。前端点"播放"发一次请求，播 3 秒后回包；
+#   想继续就再点一次。这样不存在"看不见的后台线程一直发 UDP"——
+#   页面上什么都看不见却在占板子，是最难排查的一类状态。
+# ---------------------------------------------------------------------------
+
+ANIM_MAX_SECONDS = 30.0        # 单次播放上限：别让一条请求占住板子半小时
+
+
+def _make_renderer(plan: Dict[str, Any]) -> Tuple[Any, str]:
+    """
+    按 action 造出 render(t, params) -> 1024 字节。
+
+    三个来源，优先级写在调用处：
+      * anim   → anim.ANIMS 里的内置函数（offline，不花钱）
+      * draw   → 让 LLM 现写代码（花钱、要网络，但能画任意画面）
+      * render → 同 anim，只是不发板子
+
+    ⚠ draw 走 agent.code_for()，它自带磁盘缓存（code_cache/），
+      同一个描述第二次是 0 延迟 0 花费。
+    """
+    action, arg = plan.get("action"), plan.get("arg")
+
+    if action == "anim":
+        fn = anim.get(str(arg))
+        return (lambda t, p: agent._render_named(fn, t, p)), "内置动画 %s" % arg
+
+    if action == "draw":
+        code = agent.code_for(str(arg), use_cache=True, verbose=False)
+        rend = agent.Renderer(code, timeout=3.0)
+        return (lambda t, p: rend.render(t, p)), "LLM 现写代码"
+
+    raise ValueError("action=%s 造不出渲染器" % action)
+
+
+def _play_plan(plan: Dict[str, Any], cfg: Dict[str, Any],
+               seconds: float, fps: float, report=None) -> Dict[str, Any]:
+    """
+    把一帧帧真的发到板子上。返回 {"ok", "sent", "reply", "error", "frames", "fps_real"}。
+
+    ⚠ 全程复用**一个** Board 会话：每帧新建 socket 会 bind 一个临时端口，
+      20fps 播 3 秒就是 60 个 socket，端口很快不够用。
+    """
+    out: Dict[str, Any] = {"ok": False, "sent": [], "reply": "", "error": "",
+                           "frames": 0, "fps_real": 0.0}
+    action = plan.get("action")
+    if action not in ("anim", "draw"):
+        out["error"] = "action=%s 不能用 /play 执行（用 /confirm）" % action
+        return out
+
+    seconds = max(0.1, min(ANIM_MAX_SECONDS, float(seconds)))
+    fps = max(1.0, min(60.0, float(fps)))
+    total = int(seconds * fps)
+
+    try:
+        render, what = _make_renderer(plan)
+    except Exception as e:  # noqa: BLE001
+        out["error"] = "%s: %s" % (type(e).__name__, e)
+        return out
+
+    out["sent"] = [what]
+    start = time.time()
+    n = 0
+    with Board(cfg["host"], cfg["port"], timeout=cfg["timeout"]) as b:
+        try:
+            b.ping()                       # 先探活，"板子不在"要立刻报，不要等几秒后报
+        except BoardError as e:
+            out["error"] = "板子没回 PING：%s" % e
+            return out
+
+        try:
+            while n < total:
+                t = n / fps
+                frame = render(t, {})
+                b.send_frame(frame, seq=(n & 0xFFFF))
+                n += 1
+                if report and n % 5 == 0:
+                    report(n / total, "第 %d/%d 帧" % (n, total))
+                # 按绝对时间轴对齐（与 agent.play() 同一个理由：渲染耗时会累积）
+                gap = (start + n / fps) - time.time()
+                if gap > 0:
+                    time.sleep(gap)
+        except (BoardError, SandboxError) as e:
+            out["error"] = "第 %d 帧失败：%s" % (n, e)
+            out["frames"] = n
+            return out
+        except Exception as e:  # noqa: BLE001
+            out["error"] = "第 %d 帧失败：%s: %s" % (n, type(e).__name__, e)
+            out["frames"] = n
+            return out
+
+        elapsed = time.time() - start
+        out["frames"] = n
+        out["fps_real"] = round(n / elapsed, 1) if elapsed > 0 else 0.0
+        try:
+            out["reply"] = b.fb_stat().strip()      # FB: good=.. bad=.. ooo=.. 让前端能显示丢包
+        except BoardError:
+            out["reply"] = ""
+    out["ok"] = True
+    return out
+
+
+def _render_png(plan: Dict[str, Any], t: float) -> bytes:
+    """
+    只渲染一帧成 PNG（4 倍放大），**不发板子**。
+
+    ⚠ 复用 agent._save_png 写文件而不是在这里另写一套 PNG 编码：
+      两套渲染器迟早会画出不一样的东西。先落临时文件读回来，完事删掉。
+    """
+    import tempfile
+
+    render, _ = _make_renderer(plan)
+    frame = render(max(0.0, float(t)), {})
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        agent._save_png(frame, path)
+        with open(path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
 
@@ -488,6 +622,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._post_dispatch()
         if path == "/confirm":
             return self._post_confirm()
+        if path == "/play":
+            return self._post_play()
+        if path == "/render":
+            return self._post_render()
         return self._json(404, {"error": "没有这个路径"})
 
     # ---- /dispatch：只翻译 ----
@@ -600,10 +738,104 @@ class Handler(BaseHTTPRequestHandler):
                           {"status": "done" if res.get("ok") else "error",
                            "result": res})
 
+    # ---- /play：动画走这条路（比 /confirm + run_plan 多一步"真的渲染"） ----
+
+    def _post_play(self) -> None:
+        """
+        {"text": "...", "seconds": 3, "fps": 20} → 播一段动画。
+
+        ⚠ 这里**不需要 token**，因为它不碰写命令 —— 动画走的是 FB 帧通道，
+          和 LED 寄存器是两条完全不同的路（见 AGENTS.md §3.11）。
+          但为了日志可追溯，仍然记一行 executed:true。
+        """
+        data = self._read_json()
+        if data is None:
+            return
+        text = (data.get("text") or "").strip()
+        if not text:
+            return self._json(400, {"error": "text 不能为空"})
+
+        try:
+            seconds = float(data.get("seconds") or 3.0)
+            fps = float(data.get("fps") or 20.0)
+        except (TypeError, ValueError):
+            return self._json(400, {"error": "seconds/fps 必须是数字"})
+
+        explain: List[str] = []
+        try:
+            plan = dispatcher.dispatch(text, use_llm=CFG["use_llm"],
+                                       explain=explain)
+        except agent.LLMError as e:
+            return self._json(502, {"error": "LLM 不可用：%s" % e})
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            return self._json(500, {"error": "%s: %s" % (type(e).__name__, e)})
+
+        out: Dict[str, Any] = {"raw": text, "action": plan.get("action"),
+                               "arg": plan.get("arg"), "by": plan.get("by"),
+                               "why": plan.get("why", "")}
+
+        if plan.get("action") not in ("anim", "draw"):
+            # 不是动画请求。明确告诉前端该走哪条路，别让它自己猜。
+            out["status"] = "refused"
+            out["error"] = ("这条是 %s，不是动画。%s"
+                            % (plan.get("action") or "无法分派",
+                               "写操作请先 /dispatch 再 /confirm"
+                               if plan.get("action") else plan.get("why", "")))
+            return self._json(200, out)
+
+        res = _play_plan(plan, CFG, seconds, fps)
+        dispatcher.log_plan(plan, executed=True)
+        out["status"] = "done" if res.get("ok") else "error"
+        out["result"] = res
+        return self._json(200 if res.get("ok") else 502, out)
+
+    # ---- /render：只画一帧成 PNG，不发板子 ----
+
+    def _post_render(self) -> None:
+        """
+        {"text": "...", "t": 0.0} → image/png。
+
+        ⚠ 返回的是二进制图片而不是 JSON，前端直接 <img src=...> 用不了
+          （POST 不能当 src），所以前端拿到 blob 再换 objectURL。
+          好处：预览和真发板子用的是**同一段渲染代码**，不会出现
+          "预览好看、板上不一样"。
+        """
+        data = self._read_json()
+        if data is None:
+            return
+        text = (data.get("text") or "").strip()
+        if not text:
+            return self._json(400, {"error": "text 不能为空"})
+        try:
+            t = float(data.get("t") or 0.0)
+        except (TypeError, ValueError):
+            return self._json(400, {"error": "t 必须是数字"})
+
+        try:
+            plan = dispatcher.dispatch(text, use_llm=CFG["use_llm"])
+        except agent.LLMError as e:
+            return self._json(502, {"error": "LLM 不可用：%s" % e})
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            return self._json(500, {"error": "%s: %s" % (type(e).__name__, e)})
+
+        if plan.get("action") not in ("anim", "draw"):
+            return self._json(200, {"error": "这条不是画面请求（%s）"
+                                             % (plan.get("action") or "无法分派"),
+                                    "why": plan.get("why", "")})
+        try:
+            png = _render_png(plan, t)
+        except (SandboxError, agent.LLMError) as e:
+            return self._json(200, {"error": str(e)})
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            return self._json(500, {"error": "%s: %s" % (type(e).__name__, e)})
+        return self._text(200, png, "image/png")
+
 
 def _is_reg_write(plan: Dict[str, Any]) -> bool:
     return dispatcher._is_reg_write(plan)
-
 
 def _preview(plan: Dict[str, Any]) -> List[str]:
     """给前端一行一行地预览"接下来真要发什么"，别让用户凭空点头。"""
@@ -620,6 +852,14 @@ def _preview(plan: Dict[str, Any]) -> List[str]:
         if _is_reg_write(plan):
             lines.append("⚠ 这是直接写寄存器，写错会让板子掉时钟/变砖")
         return lines
+    if action == "anim":
+        return ["播放内置动画 %s" % arg,
+                "板子会被占住这段时间，期间别的命令照常回包"]
+    if action == "draw":
+        return ["让 LLM 现写代码画：%s" % arg,
+                "代码先在沙箱里试渲染，通过了才发板子"]
+    if action == "render":
+        return ["只渲染一帧看效果，不发板子"]
     return [str(arg)]
 
 

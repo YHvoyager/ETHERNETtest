@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OLED 助手</title>
+<!--
+  阶段三：浏览器前端（pc_agent/index.html）
+
+  【为什么是单文件、零依赖、零 CDN】
+    这个页面只在本机 127.0.0.1 上跑，只为一个人服务。引入 React/Vue 会把
+    "打开就能用"变成"先跑 npm install"。CDN 更糟：断网就白屏，而它的作用
+    场景恰恰是"板子在 192.168.1.30、PC 直连"的环境。
+    400 行原生 JS 表达力足够，且你改一行就能看到效果，不用等打包。
+
+  【它做什么】
+    你打一句话 → POST /dispatch → 服务端翻译成结构化指令
+      ├ 只读 / 纯画面 → 直接执行，显示结果
+      ├ 写操作        → 显示"将要发什么" + [确认] 按钮（带倒计时）
+      └ 没把握        → 明确拒绝，并给出建议
+    动画类（anim/draw）走 POST /render 预览 PNG + POST /play 真播。
+
+  【它不做什么】
+    不自己拼固件命令、不自己判断哪些是写操作。**所有安全判据都在服务端**
+    （dispatcher.needs_confirm + api.py 的 token 验签）。前端只是把
+    "要确认"这件事显示出来 —— 改这个页面的 JS 一点也提升不了权限。
+-->
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel2: #1c2230;
+    --line: #2a3341; --fg: #d7dee8; --dim: #7d8b9e;
+    --accent: #4f9cf9; --ok: #3fb950; --warn: #d29922;
+    --bad: #f85149; --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.55 system-ui, "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px;
+    padding: 12px 20px; border-bottom: 1px solid var(--line);
+    background: var(--panel); position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .5px; }
+  #dot {
+    width: 9px; height: 9px; border-radius: 50%; background: var(--dim);
+    flex: none; transition: background .3s;
+  }
+  #dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  #dot.off { background: var(--bad); }
+  #status { color: var(--dim); font-size: 12px; }
+  main {
+    display: grid; grid-template-columns: minmax(0, 1fr) 340px;
+    gap: 18px; padding: 18px 20px 40px; max-width: 1180px; margin: 0 auto;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); } }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  .card h2 {
+    margin: 0; padding: 10px 14px; font-size: 12px; font-weight: 600;
+    color: var(--dim); letter-spacing: 1px; text-transform: uppercase;
+    border-bottom: 1px solid var(--line);
+  }
+  .body { padding: 14px; }
+
+  /* ---- 输入 ---- */
+  #composer { display: flex; gap: 8px; }
+  #say {
+    flex: 1; min-width: 0; resize: vertical; min-height: 54px;
+    background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px; font: inherit;
+  }
+  #say:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 14px; font: inherit; cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  button:hover:not(:disabled) { background: #26303f; border-color: #3d4a5c; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #04121f; font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: #6cadfb; }
+  button.danger { background: #4a1d1d; border-color: var(--bad); color: #ffb3ae; }
+  button.danger:hover:not(:disabled) { background: #5e2323; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .chip {
+    font-size: 12px; padding: 4px 10px; border-radius: 99px;
+    border: 1px solid var(--line); color: var(--dim); cursor: pointer;
+    background: transparent;
+  }
+  .chip:hover { color: var(--fg); border-color: var(--accent); }
+
+  /* ---- 结果 ---- */
+  #log { margin-top: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .turn { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .turn .said {
+    padding: 9px 14px; background: var(--panel2); font-weight: 500;
+    border-bottom: 1px solid var(--line); word-break: break-word;
+  }
+  .turn .said .t {
+    color: var(--dim); font-weight: 400; font-size: 12px; float: right;
+  }
+  .turn .act { padding: 12px 14px; }
+  .kv { display: grid; grid-template-columns: 78px 1fr; gap: 5px 10px; font-size: 13px; }
+  .kv .k { color: var(--dim); }
+  .kv .v { font-family: var(--mono); word-break: break-all; }
+
+  .tag {
+    display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 4px;
+    border: 1px solid currentColor; font-family: var(--mono);
+  }
+  .t-done { color: var(--ok); }
+  .t-needs { color: var(--warn); }
+  .t-refused { color: var(--dim); }
+  .t-error { color: var(--bad); }
+
+  .warnbox {
+    margin-top: 10px; padding: 10px 12px; border-radius: 8px;
+    background: #2a2412; border: 1px solid var(--warn); color: #f0d38a;
+    font-size: 13px;
+  }
+  .warnbox.red { background: #2c1616; border-color: var(--bad); color: #ffb3ae; }
+  .previews { margin: 8px 0 0; padding-left: 18px; font-family: var(--mono); font-size: 12.5px; }
+  .previews li { margin: 2px 0; word-break: break-all; }
+
+  pre.reply {
+    margin: 10px 0 0; padding: 10px 12px; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px; overflow-x: auto;
+    font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap;
+    word-break: break-all; max-height: 260px;
+  }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+  .row .hint { color: var(--dim); font-size: 12px; }
+
+  .bar { height: 4px; background: var(--line); border-radius: 99px; overflow: hidden; margin-top: 10px; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+
+  /* ---- 右栏 ---- */
+  .screen {
+    display: grid; place-items: center; padding: 14px;
+    background: #000; border-radius: 10px; border: 1px solid var(--line);
+    min-height: 150px;
+  }
+  #preview { width: 100%; max-width: 300px; image-rendering: pixelated; display: none; }
+  #previewEmpty { color: #45505f; font-size: 12px; text-align: center; }
+  .kvs { font-size: 12.5px; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; }
+  .kvs .k { color: var(--dim); }
+  .kvs .v { font-family: var(--mono); word-break: break-all; }
+  #cmds { font-size: 12px; color: var(--dim); line-height: 1.8; }
+  #cmds code { color: var(--fg); font-family: var(--mono); }
+</style>
+</head>
+<body>
+
+<header>
+  <div id="dot"></div>
+  <h1>OLED 助手</h1>
+  <span id="status">连接中…</span>
+</header>
+
+<main>
+  <section>
+    <div class="card">
+      <div class="body">
+        <div id="composer">
+          <textarea id="say" rows="2"
+            placeholder="想干什么就说，例如：把灯打开 / 播个烟花 / 在吗 / 屏幕上一个字都没了"></textarea>
+          <button id="go" class="primary">发送</button>
+        </div>
+        <div class="chips" id="chips"></div>
+      </div>
+    </div>
+
+    <div id="log"></div>
+  </section>
+
+  <aside style="display:flex;flex-direction:column;gap:14px">
+    <div class="card">
+      <h2>画面预览</h2>
+      <div class="body" style="padding:10px">
+        <div class="screen">
+          <img id="preview" alt="preview">
+          <div id="previewEmpty">说一句"播个烟花"<br>再点「预览」</div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <input id="pt" type="number" step="0.1" value="0" min="0"
+                 style="width:70px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit">
+          <span class="hint">秒</span>
+          <button id="prevBtn">预览</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>板子</h2>
+      <div class="body kvs" id="info">
+        <span class="k">目标</span><span class="v">—</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>常用说法</h2>
+      <div class="body" id="cmds">加载中…</div>
+    </div>
+  </aside>
+</main>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// 状态
+// ---------------------------------------------------------------------------
+const S = { busy: false, cfg: null };
+
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+};
+const now = () => new Date().toLocaleTimeString("zh-CN", { hour12: false });
+
+// ---------------------------------------------------------------------------
+// 请求
+//
+// ⚠ 统一走这里而不是满地 fetch：错误处理只写一次。
+//   服务端的错误有两种形状 —— 非 2xx 时 JSON 里是 {error}，2xx 但业务失败时
+//   是 {status:"refused"/"error"}。两种都要拿出来给用户看，不能只 catch 网络错误。
+// ---------------------------------------------------------------------------
+async function post(path, body, asBinary = false) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (asBinary && r.ok) {
+    const ct = r.headers.get("Content-Type") || "";
+    if (ct.startsWith("image/")) return await r.blob();
+  }
+  let data;
+  try { data = await r.json(); } catch { data = { error: "服务端返回了非 JSON" }; }
+  if (!r.ok) data.__http = r.status;
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// 顶部状态灯
+// ---------------------------------------------------------------------------
+async function pollHealth() {
+  try {
+    const r = await fetch("/healthz", { cache: "no-store" });
+    const d = await r.json();
+    $("dot").className = "on";
+    $("status").textContent = `板子 ${d.board} · ${d.llm ? "LLM 开" : "只用规则层"}`;
+    $("info").replaceChildren(
+      kv("目标", `${d.board}`),
+      kv("LLM", d.llm ? "已启用" : "已关闭（--no-llm）"),
+      kv("服务", location.origin),
+    );
+  } catch {
+    $("dot").className = "off";
+    $("status").textContent = "服务未连接";
+  }
+}
+
+function kv(k, v) {
+  const f = document.createDocumentFragment();
+  f.append(el("span", "k", k), el("span", "v", v));
+  return f;
+}
+
+// ---------------------------------------------------------------------------
+// 一次对话轮次
+// ---------------------------------------------------------------------------
+function makeTurn(text) {
+  const turn = el("div", "turn");
+  const said = el("div", "said", text);
+  said.append(el("span", "t", now()));
+  turn.append(said);
+  const act = el("div", "act");
+  turn.append(act);
+  $("log").prepend(turn);
+  return { turn, act };
+}
+
+function tag(cls, label) {
+  return el("span", "tag " + cls, label);
+}
+
+// ---------------------------------------------------------------------------
+// 主流程：说一句话
+// ---------------------------------------------------------------------------
+async function say(text) {
+  text = (text ?? $("say").value).trim();
+  if (!text || S.busy) return;
+  $("say").value = "";
+  S.busy = true; $("go").disabled = true;
+
+  const { act } = makeTurn(text);
+  act.append(el("div", "hint", "正在翻译…"));
+
+  try {
+    const d = await post("/dispatch", { text, explain: true });
+    act.replaceChildren();
+
+    if (d.error) {
+      act.append(tag("t-error", "失败"), el("div", "previews", d.error));
+      return;
+    }
+
+    // ---- 没把握：明确拒绝，并给出下一步建议 ----
+    if (d.status === "refused") {
+      act.append(tag("t-refused", "没听懂"));
+      act.append(kvBlock([
+        ["说明", d.why || "规则和 LLM 都没把握"],
+        ["来源", d.by || "—"],
+      ]));
+      act.append(el("div", "hint", "换个说法试试，或者说得更具体：\"播动画 烟花\"、\"把 DS0 打开\"。"));
+      return;
+    }
+
+    const isAnim = d.action === "anim" || d.action === "draw";
+
+    // ---- 写操作：只显示"将要发什么"，绝不自动执行 ----
+    if (d.status === "needs_confirm") {
+      act.append(tag("t-needs", "需要确认"));
+      act.append(kvBlock([
+        ["动作", d.action],
+        ["参数", JSON.stringify(d.arg)],
+        ["来源", d.by],
+        ["为什么", d.why],
+      ]));
+
+      const box = el("div", "warnbox" + (d.risk === "reg_write" ? " red" : ""));
+      box.append(el("div", "", d.risk === "reg_write"
+        ? "⚠ 这是直接写寄存器，写错会让板子掉时钟/变砖。"
+        : "⚠ 这会真的改变板子状态。确认后才会发出去。"));
+      const ul = el("ul", "previews");
+      (d.preview || []).forEach((line) => ul.append(el("li", "", line)));
+      box.append(ul);
+      act.append(box);
+
+      // 倒计时：token 过期后按钮自己失效，不必假装还能点
+      const row = el("div", "row");
+      const okBtn = el("button", d.risk === "reg_write" ? "danger" : "primary",
+                       isAnim ? "确认播放" : "确认执行");
+      const noBtn = el("button", "", "取消");
+      const hint = el("span", "hint", `有效期 ${d.expires_in} 秒`);
+      let left = d.expires_in;
+      const timer = setInterval(() => {
+        left -= 1;
+        if (left <= 0) {
+          clearInterval(timer);
+          hint.textContent = "已过期，重新说一遍";
+          okBtn.disabled = true;
+        } else {
+          hint.textContent = `有效期 ${left} 秒`;
+        }
+      }, 1000);
+
+      noBtn.onclick = () => { clearInterval(timer); row.remove(); };
+      okBtn.onclick = async () => {
+        clearInterval(timer);
+        okBtn.disabled = noBtn.disabled = true;
+        await confirmAndRun(d, act, row);
+      };
+      row.append(okBtn, noBtn, hint);
+      act.append(row);
+      return;
+    }
+
+    // ---- 只读：服务端已经执行了，直接显示 ----
+    if (d.status === "done") {
+      act.append(tag("t-done", "已执行"));
+      act.append(kvBlock([["命令", d.result?.sent?.join(" ") || d.arg]]));
+      if (d.result?.reply) act.append(el("pre", "reply", d.result.reply));
+      $("info").replaceChildren(...$("info").children); // no-op，保持结构
+      return;
+    }
+
+    // ---- 其它（error） ----
+    act.append(tag("t-error", "出错"));
+    act.append(el("pre", "reply", JSON.stringify(d, null, 2)));
+  } catch (e) {
+    act.replaceChildren(tag("t-error", "网络错误"), el("pre", "reply", String(e)));
+  } finally {
+    S.busy = false; $("go").disabled = false; $("say").focus();
+    pollHealth();
+  }
+}
+
+async function confirmAndRun(d, act, row) {
+  const isAnim = d.action === "anim" || d.action === "draw";
+  row.replaceChildren(el("span", "hint", "执行中…"));
+  const bar = el("div", "bar"); bar.append(el("i"));
+  act.append(bar);
+
+  try {
+    if (isAnim) {
+      // 动画：一次播 3 秒，想继续再点一次。不做"一直播到点停"——
+      // 那样页面上看着停了，后台线程还在发 UDP，最难排查。
+      const SECONDS = 3, FPS = 20;
+      const d2 = await post("/confirm", { token: d.token });
+      if (d2.status === "running" && d2.job) {
+        await pollJob(d2.job, bar.firstChild, row);
+      } else {
+        row.replaceChildren(el("span", "hint", d2.error || "没启动起来"));
+      }
+      return;
+    }
+    const r = await post("/confirm", { token: d.token });
+    bar.firstChild.style.width = "100%";
+    if (r.status === "done") {
+      row.replaceChildren(tag("t-done", "已执行"));
+      act.append(el("pre", "reply", r.result?.reply || "OK"));
+    } else {
+      row.replaceChildren(tag("t-error", "失败"));
+      act.append(el("pre", "reply", r.error || JSON.stringify(r, null, 2)));
+    }
+  } catch (e) {
+    row.replaceChildren(tag("t-error", "网络错误"), el("span", "hint", String(e)));
+  }
+}
+
+async function pollJob(id, barEl, row) {
+  let last = "";
+  for (let i = 0; i < 600; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+    let j;
+    try {
+      j = await (await fetch("/job/" + id, { cache: "no-store" })).json();
+    } catch { continue; }
+    if (j.error && !j.state) { row.replaceChildren(el("span", "hint", j.error)); return; }
+    barEl.style.width = Math.round((j.progress || 0) * 100) + "%";
+    const note = (j.notes || []).slice(-1)[0] || "";
+    if (note !== last) { last = note; row.replaceChildren(el("span", "hint", note)); }
+    if (j.state === "done" || j.state === "error") {
+      barEl.style.width = "100%";
+      if (j.state === "done") {
+        row.replaceChildren(tag("t-done", "已完成"));
+        if (j.result?.reply) row.append(el("span", "hint", j.result.reply));
+      } else {
+        row.replaceChildren(tag("t-error", "失败"),
+                            el("span", "hint", j.error || "未知错误"));
+      }
+      return;
+    }
+  }
+  row.replaceChildren(el("span", "hint", "等太久了，看一下终端"));
+}
+
+function kvBlock(pairs) {
+  const g = el("div", "kv");
+  pairs.forEach(([k, v]) => g.append(kv(k, v === undefined ? "—" : String(v))));
+  g.append(el("span", "k", ""), el("span", "v", ""));
+  return g;
+}
+
+// ---------------------------------------------------------------------------
+// 预览：POST /render 拿 PNG blob
+// ---------------------------------------------------------------------------
+async function preview() {
+  const text = $("say").value.trim() || lastSaid();
+  if (!text) return;
+  $("prevBtn").disabled = true;
+  try {
+    const t = parseFloat($("pt").value) || 0;
+    const blob = await post("/render", { text, t }, true);
+    if (blob instanceof Blob) {
+      if ($("preview").dataset.url) URL.revokeObjectURL($("preview").dataset.url);
+      const url = URL.createObjectURL(blob);
+      $("preview").src = url;
+      $("preview").dataset.url = url;
+      $("preview").style.display = "block";
+      $("previewEmpty").style.display = "none";
+    } else {
+      $("previewEmpty").textContent = blob.error || "这条不是画面请求";
+      $("previewEmpty").style.display = "block";
+      $("preview").style.display = "none";
+    }
+  } catch (e) {
+    $("previewEmpty").textContent = "渲染失败：" + e;
+  } finally {
+    $("prevBtn").disabled = false;
+  }
+}
+
+function lastSaid() {
+  const first = $("log").querySelector(".turn .said");
+  return first ? first.textContent.replace(/\d\d:\d\d:\d\d$/, "").trim() : "";
+}
+
+// ---------------------------------------------------------------------------
+// 启动
+// ---------------------------------------------------------------------------
+const EXAMPLES = [
+  "在吗", "把 DS0 打开", "闪灯 3 次", "播个烟花", "下雨",
+  "播眼睛 5 秒", "清屏", "屏幕上一个字都没了", "画一只打哈欠的猫", "读一下 GPIOB",
+];
+
+function bootChips() {
+  const box = $("chips");
+  EXAMPLES.forEach((s) => {
+    const c = el("button", "chip", s);
+    c.onclick = () => say(s);
+    box.append(c);
+  });
+}
+
+async function bootCmds() {
+  try {
+    const d = await (await fetch("/commands", { cache: "no-store" })).json();
+    const box = $("cmds");
+    box.replaceChildren();
+    box.append(el("div", "", "动作：" + (d.actions || []).join(" / ")));
+    box.append(el("div", "", "固件命令："));
+    const wrap = el("div");
+    (d.firmware_cmds || []).forEach((c, i) => {
+      if (i) wrap.append(document.createTextNode(" · "));
+      wrap.append(el("code", "", c));
+    });
+    box.append(wrap);
+  } catch { /* 服务没起来时静默，状态灯已经说了 */ }
+}
+
+$("go").onclick = () => say();
+$("say").addEventListener("keydown", (e) => {
+  // Enter 发送，Shift+Enter 换行 —— 与常见聊天框一致
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    say();
+  }
+});
+$("prevBtn").onclick = preview;
+
+bootChips();
+bootCmds();
+pollHealth();
+setInterval(pollHealth, 5000);
+$("say").focus();
+</script>
+</body>
+</html>
